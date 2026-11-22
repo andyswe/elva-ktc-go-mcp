@@ -175,6 +175,17 @@ func TestReader(t *testing.T) {
 		if err != nil || res.Rows[0][0] != "2026-03-28 00:00:00+01" {
 			t.Errorf("session time zone: %v, %v", res, err)
 		}
+		// Cells are always scalars: composite values come back as their JSON text.
+		res, err = r.Query(ctx, `SELECT '{"a":1}'::jsonb, ARRAY[1,2], 1.5::numeric, NULL::int, true, interval '90 minutes'`, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []any{`{"a":1}`, "[1,2]", 1.5, nil, true, "01:30:00"}
+		for i, w := range want {
+			if res.Rows[0][i] != w {
+				t.Errorf("cell %d (%s) = %#v, want %#v", i, res.Columns[i], res.Rows[0][i], w)
+			}
+		}
 		for _, bad := range []string{
 			"DELETE FROM measurement",
 			"SELECT 1; DELETE FROM measurement",

@@ -329,7 +329,7 @@ to be exposed to the network, and your SSH key is the authentication.
 | `get_timeseries` | Power or water flow over time, downsampled to at most 500 steps (min/avg/max) |
 | `get_baseload` | Standby power and water use per night (default 01:00-05:00), typical baseload, kWh per year and trend. Grouped per week or month for long ranges |
 | `get_data_info` | Rows, first and last reading, and gaps |
-| `query` | Any single read-only SQL statement (row limit, statement timeout) |
+| `query` | Any single read-only SQL statement (row limit, statement timeout). Cells are strings, numbers, booleans or null; times are local, and JSON or array values come back as their JSON text |
 
 It also offers the resource `elva://schema`, describing the table and its units. Times
 in and out are local (`ELVA_TIMEZONE`, default `Europe/Stockholm`). Inputs accept

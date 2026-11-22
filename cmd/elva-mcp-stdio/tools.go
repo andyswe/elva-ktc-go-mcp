@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/andyswe/elva-ktc-go-mcp/internal/store"
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -99,7 +100,7 @@ func newServer(log *slog.Logger, s *server) *mcp.Server {
 		Description: "What data exists: row counts, first and last reading, and gaps (periods without readings). " +
 			"Check this before comparing periods or trusting averages."},
 		s.dataInfo)
-	add(log, srv, &mcp.Tool{Name: "query", Annotations: ro,
+	add(log, srv, &mcp.Tool{Name: "query", Annotations: ro, OutputSchema: queryOutputSchema,
 		Description: fmt.Sprintf("Run one read-only SQL SELECT against the measurement table (see resource elva://schema). "+
 			"Session time zone is %s. At most %d rows are returned; aggregate in SQL instead of fetching raw minutes.",
 			s.loc, s.maxRows)},
@@ -115,8 +116,18 @@ func newServer(log *slog.Logger, s *server) *mcp.Server {
 	return srv
 }
 
-// add registers a tool and logs every call (to stderr; stdout is the MCP protocol).
+// add registers a tool with portable schemas (see schemaFor) and logs every call
+// (to stderr; stdout is the MCP protocol).
 func add[In, Out any](log *slog.Logger, srv *mcp.Server, t *mcp.Tool, h func(context.Context, In) (Out, error)) {
+	var err error
+	if t.InputSchema, err = schemaFor[In](); err != nil {
+		panic(fmt.Sprintf("input schema of %s: %v", t.Name, err))
+	}
+	if t.OutputSchema == nil { // a tool may bring its own, see queryOutputSchema
+		if t.OutputSchema, err = schemaFor[Out](); err != nil {
+			panic(fmt.Sprintf("output schema of %s: %v", t.Name, err))
+		}
+	}
 	mcp.AddTool(srv, t, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
 		start := time.Now()
 		out, err := h(ctx, in)
@@ -508,6 +519,24 @@ func (s *server) dataInfo(ctx context.Context, in dataInfoIn) (dataInfoOut, erro
 }
 
 // --- query
+
+// queryOutputSchema is written by hand: the inferred one would describe a cell
+// (Go any) as the bare schema true, which some MCP clients refuse.
+var queryOutputSchema = &jsonschema.Schema{
+	Type: "object",
+	Properties: map[string]*jsonschema.Schema{
+		"columns": {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "column names"},
+		"rows": {Type: "array", Description: "result rows; each row has one cell per column", Items: &jsonschema.Schema{
+			Type: "array",
+			Items: &jsonschema.Schema{
+				Description: "a cell: times are local RFC 3339 strings; JSON, arrays and other composite values are their JSON text",
+				AnyOf:       []*jsonschema.Schema{{Type: "string"}, {Type: "number"}, {Type: "boolean"}, {Type: "null"}},
+			},
+		}},
+		"truncated": {Type: "boolean", Description: "true if more rows existed than the row limit"},
+	},
+	Required: []string{"columns", "rows", "truncated"},
+}
 
 type queryIn struct {
 	SQL string `json:"sql" jsonschema:"a single read-only SQL statement, e.g. SELECT ... FROM measurement"`

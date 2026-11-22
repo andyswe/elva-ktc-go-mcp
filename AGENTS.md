@@ -46,6 +46,13 @@ keep anything specific to one installation out of this file.
 
    Tool output goes into a model's context, so keep answers small: cap the number of
    buckets and points, and group long ranges, as `get_baseload` does.
+7. **Keep tool schemas portable.** Some MCP clients (and model providers with
+   single-type schema dialects) refuse `"type": [...]` arrays and bare `true`/`false`
+   schemas.
+   - `add()` builds every schema with `schemaFor` (`cmd/elva-mcp-stdio/schema.go`),
+     which rewrites nullable types to `anyOf`.
+   - A Go `any` in a result needs a hand-written schema (see `queryOutputSchema`).
+   - `TestTools` fails on any unportable construct.
 
 ## Build, test, run
 
@@ -130,6 +137,7 @@ written", and the table should have no gap.
 | `internal/store/store.go` | PostgreSQL writer: `Open` (connect, create schema), `Insert` (one `unnest` statement, `ON CONFLICT DO NOTHING`), `Latest`, `Schema` |
 | `internal/store/read.go` | Read-only `Reader` for the MCP server: `Consumption`, `Timeseries`, `Baseload`, `Info`, `Query` |
 | `internal/testdb/testdb.go` | Test helper: a fresh schema per test package in the test PostgreSQL |
+| `scripts/mcp-inspect.sh` | Dev helper: opens the MCP Inspector (Node.js 22+) on `bin/elva-mcp-stdio`, connected to the test database |
 | `scripts/build.sh` | Builds `bin/elva` and `bin/elva-mcp-stdio` with `-X main.version=$(git describe --tags --always --dirty)` |
 | `deploy/elva.service` | systemd unit template (`@PREFIX@` is replaced by `install.sh`) |
 | `deploy/install.sh` | Install or upgrade: user `elva`, `PREFIX/bin/elva`, `PREFIX/elva.env` (never overwritten), unit; enable and restart. Also `elva-mcp-stdio`, group `elva-mcp` and `PREFIX/mcp.env` (0640 root:elva-mcp) |
@@ -285,8 +293,15 @@ CREATE TABLE IF NOT EXISTS measurement (
   1-3.5 s, and the largest answers are about 10 KB (month buckets) and 30 KB (500
   timeseries points).
 - **Testing:** `main_test.go` connects a real MCP client over in-memory transports and
-  calls every tool. For a manual stdio test, pipe JSON-RPC lines into the binary
-  (`initialize`, `notifications/initialized`, `tools/call`).
+  calls every tool. By hand:
+  - **`scripts/mcp-inspect.sh`** opens the [MCP Inspector](https://github.com/modelcontextprotocol/inspector)
+    web UI against the test database. Add `--cli --method tools/list` (or
+    `tools/call --tool-name ... --tool-arg key=value`) for terminal use.
+  - **Defaults:** the test container (`elva-test-pg`) with role `elva_ro`, password
+    `ro` (`deploy/readonly-role.sql`, run with `-v pw="'ro'"`). Override with
+    `ELVA_DATABASE_URL`; `ELVA_TEST_SCHEMA=perf` reads a schema of synthetic data.
+  - **Raw stdio:** pipe JSON-RPC lines into the binary (`initialize`,
+    `notifications/initialized`, `tools/call`).
 
 **Grafana** reads directly from PostgreSQL.
 

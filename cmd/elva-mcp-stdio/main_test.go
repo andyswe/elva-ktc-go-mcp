@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -94,6 +95,39 @@ func session(t *testing.T) *mcp.ClientSession {
 	return cs
 }
 
+// unportable lists schema constructs some MCP clients refuse: "type" arrays, and
+// bare true/false where a schema object is expected.
+func unportable(s map[string]any, path string) []string {
+	var out []string
+	if _, ok := s["type"].([]any); ok {
+		out = append(out, path+": type is an array")
+	}
+	sub := func(p string, v any) {
+		switch x := v.(type) {
+		case bool:
+			out = append(out, p+": bare boolean schema")
+		case map[string]any:
+			out = append(out, unportable(x, p)...)
+		}
+	}
+	for _, k := range []string{"items", "additionalProperties", "not", "contains", "propertyNames"} {
+		if v, ok := s[k]; ok && !(k == "additionalProperties" && v == false) { // false = no extra properties: fine
+			sub(path+"."+k, v)
+		}
+	}
+	for _, k := range []string{"anyOf", "oneOf", "allOf", "prefixItems"} {
+		list, _ := s[k].([]any)
+		for i, v := range list {
+			sub(fmt.Sprintf("%s.%s[%d]", path, k, i), v)
+		}
+	}
+	props, _ := s["properties"].(map[string]any)
+	for k, v := range props {
+		sub(path+".properties."+k, v)
+	}
+	return out
+}
+
 // call runs a tool and decodes its structured result into out.
 func call(t *testing.T, cs *mcp.ClientSession, name string, args map[string]any, out any) *mcp.CallToolResult {
 	t.Helper()
@@ -141,6 +175,25 @@ func TestTools(t *testing.T) {
 	schema, _ := json.Marshal(tools.Tools[1].InputSchema) // get_consumption
 	if !strings.Contains(string(schema), `"from"`) || !strings.Contains(string(schema), `"bucket"`) {
 		t.Errorf("get_consumption schema lacks from/bucket: %s", schema)
+	}
+	// Portable schemas (see schemaFor): every tool's input and output is an object,
+	// and no schema anywhere has a "type" array or is a bare true/false.
+	for _, tool := range tools.Tools {
+		for kind, sc := range map[string]any{"input": tool.InputSchema, "output": tool.OutputSchema} {
+			var doc map[string]any
+			b, _ := json.Marshal(sc)
+			if json.Unmarshal(b, &doc) != nil || doc["type"] != "object" {
+				t.Errorf("%s %s schema is not an object: %.100s", tool.Name, kind, b)
+				continue
+			}
+			for _, problem := range unportable(doc, tool.Name+"."+kind) {
+				t.Error(problem)
+			}
+		}
+	}
+	latestSchema, _ := json.Marshal(tools.Tools[3].OutputSchema) // get_latest
+	if !strings.Contains(string(latestSchema), `"power_w":{"anyOf":[{"type":"null"},{`) {
+		t.Errorf("get_latest power_w not rewritten to anyOf: %s", latestSchema)
 	}
 
 	res, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: "elva://schema"})

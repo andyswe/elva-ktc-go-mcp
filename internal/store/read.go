@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -297,7 +298,7 @@ func (r *Reader) Info(ctx context.Context, from, to time.Time, minGap time.Durat
 // QueryResult is the result of a raw read-only query.
 type QueryResult struct {
 	Columns   []string `json:"columns"`
-	Rows      [][]any  `json:"rows"`
+	Rows      [][]any  `json:"rows"`      // each cell is a string, number, boolean or nil
 	Truncated bool     `json:"truncated"` // more rows existed than maxRows
 }
 
@@ -335,8 +336,10 @@ func (r *Reader) Query(ctx context.Context, sql string, maxRows int) (*QueryResu
 	return res, rows.Err()
 }
 
-// jsonValue makes a database value JSON-friendly: local times, plain strings for
-// types without a JSON form.
+// jsonValue turns a database value into a JSON scalar: string, number, boolean or nil.
+// Times become local RFC 3339 strings; numerics become numbers; anything composite
+// (json, arrays, ranges, ...) becomes its JSON text as a string, so the query tool's
+// output schema stays simple and portable.
 func (r *Reader) jsonValue(v any) any {
 	switch x := v.(type) {
 	case nil, bool, string, int16, int32, int64, float32, float64:
@@ -348,10 +351,27 @@ func (r *Reader) jsonValue(v any) any {
 	case []byte:
 		return string(x)
 	}
-	if b, err := json.Marshal(v); err == nil {
-		return json.RawMessage(b)
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprint(v)
 	}
-	return fmt.Sprint(v)
+	var scalar any
+	if json.Unmarshal(b, &scalar) == nil {
+		switch scalar.(type) {
+		case nil, bool, string, float64:
+			return scalar // e.g. numeric -> number, uuid -> string
+		}
+	}
+	// pgx types without a natural JSON form (interval, ranges, ...) know their
+	// PostgreSQL text form.
+	if dv, ok := v.(driver.Valuer); ok {
+		if text, err := dv.Value(); err == nil {
+			if str, ok := text.(string); ok {
+				return str
+			}
+		}
+	}
+	return string(b) // json, arrays: their JSON text
 }
 
 func ptr[T any](v T) *T { return &v }
