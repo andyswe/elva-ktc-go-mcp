@@ -40,7 +40,7 @@ This is version 2, a small Go rewrite of [elva-ktc](https://github.com/andyswe/e
 ```sh
 git clone https://github.com/andyswe/elva-ktc-go-mcp.git
 cd elva-ktc-go-mcp
-go build -o bin/elva ./cmd/elva
+scripts/build.sh                # builds bin/elva and bin/elva-mcp-stdio
 
 cp .env.sample .env.mine        # .env.* files are git-ignored
 $EDITOR .env.mine               # set KTC_HOST, KTC_PASSWORD and ELVA_DATABASE_URL
@@ -57,8 +57,9 @@ docker run -d --name elva-pg -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=elva \
 # ELVA_DATABASE_URL=postgres://postgres:secret@127.0.0.1:5432/elva
 ```
 
-ElVa produces a single static binary with no dependencies. To run it on another
-machine, build it there or cross-compile it, for example
+ElVa builds to two static binaries with no runtime dependencies: `elva`, which reads
+and stores, and `elva-mcp-stdio`, the optional MCP server. To run them on another
+machine, build them there, or cross-compile with plain `go build`, for example
 `GOOS=linux GOARCH=arm64 go build -o bin/elva ./cmd/elva` for a Raspberry Pi.
 
 ## Install as a service
@@ -77,9 +78,11 @@ sudo deploy/verify.sh            # checks installation, settings, service, RCU a
 
 | Path | |
 |------|---|
-| `/opt/elva/bin/elva` | The binary, owned by root |
-| `/opt/elva/elva.env` | Settings, readable only by root and the service (`0640 root:elva`) |
+| `/opt/elva/bin/elva` | The reader, owned by root |
+| `/opt/elva/elva.env` | Its settings, readable only by root and the service (`0640 root:elva`) |
 | `/etc/systemd/system/elva.service` | The systemd unit, generated from `deploy/elva.service` |
+| `/opt/elva/bin/elva-mcp-stdio` | The MCP server, if built ([MCP server](#mcp-server-ask-an-ai-assistant-about-your-data)) |
+| `/opt/elva/mcp.env` | Its settings, readable only by root and the group `elva-mcp` (`0640 root:elva-mcp`) |
 
 The service runs as the unprivileged system user `elva`, with systemd's sandboxing
 options enabled. Use `PREFIX=/some/dir` with the deploy scripts to install somewhere
@@ -94,9 +97,9 @@ other than `/opt/elva`.
   database, as the service user with the installed settings. Finally it shows when the
   last row was stored and any warnings in the journal from the past hour. It exits
   with 1 if anything failed.
-- **Uninstall:** `sudo deploy/uninstall.sh` removes the service and the binary but
-  keeps `elva.env`. Add `--purge` to also remove `/opt/elva` and the `elva` user. The
-  database is never touched.
+- **Uninstall:** `sudo deploy/uninstall.sh` removes the service and the binaries but
+  keeps `elva.env` and `mcp.env`. Add `--purge` to also remove `/opt/elva`, the `elva`
+  user and the `elva-mcp` group. The database is never touched.
 - **Restarts** depend on why ElVa stopped:
   - A missing network or database (exit codes 2 and 5) is retried every 30 s, e.g.
     at boot before they are up.
@@ -120,9 +123,9 @@ other secrets are masked, including passwords inside connection URLs.
 | `KTC_HOST` | *(required)* | Host or `host:port` of the RCU, e.g. `192.168.1.100` |
 | `KTC_PASSWORD` | *(required)* | RCU web UI password |
 | `KTC_METERS` | all meters | Comma-separated meter names to read, e.g. `EL-01,VV-01` |
+| `KTC_TIMEZONE` | `Europe/Stockholm` | Time zone of the RCU's clock; its timestamps carry none |
 | `ELVA_INTERVAL` | `1m` | Scrape interval, aligned to the wall clock (whole minutes) |
 | `ELVA_TIMEOUT` | `10s` | Timeout per request to the RCU and per database operation |
-| `KTC_TIMEZONE` | `Europe/Stockholm` | Time zone of the RCU's clock; its timestamps carry none |
 | `ELVA_MAX_METER_AGE` | `2m` | Warn when the RCU's last read of a meter is older than this |
 | `ELVA_DATABASE_URL` | *(unset)* | PostgreSQL URL, e.g. `postgres://elva:pw@localhost:5432/elva`. Unset: print JSON to stdout |
 | `ELVA_DATABASE_BUFFER` | `168h` | How long to keep readings in memory while the database is unreachable |
@@ -151,8 +154,8 @@ repeats the same values.
      to `ELVA_DATABASE_BUFFER` (one week by default). A restart of ElVa during an
      outage loses the buffered rows. Even then, consumption over the gap can still
      be computed from the totals.
-   - **Logs** go to stderr; ElVa has no log file of its own. Under systemd they end up in the journal
-   (`journalctl -u elva`), and in a container they go to `docker logs`.
+   - **Logs** go to stderr; ElVa has no log file of its own. Under systemd they end up
+     in the journal (`journalctl -u elva`), and in a container they go to `docker logs`.
    - **A failed scrape** is logged and retried on the next minute, so a rebooting
      RCU or a network glitch doesn't stop the service.
 
@@ -223,7 +226,7 @@ It was taken at 13:28 on 22 November.
       // RCU M-Bus slot the meter sits in: 1 means object "MB1" in the RCU web UI.
       "pos": 1,
       // Name configured on the RCU. "VV" is the Swedish abbreviation for varmvatten,
-      // so this is most likely a hot-water meter. Cold water isn't metered here.
+      // so this is most likely a hot-water meter; cold water is often not metered.
       "name": "VV-01",
       // The meter's own M-Bus serial number (secondary address), printed on the meter.
       "meter_id": "12345678",
@@ -326,7 +329,7 @@ to be exposed to the network, and your SSH key is the authentication.
 |------|-----------------|
 | `get_latest` | Power right now, water flow, meter totals, and how old the reading is |
 | `get_consumption` | kWh and litres per hour, day, week, month or year (from the meter totals, so correct across gaps and DST), with average and peak power |
-| `get_timeseries` | Power or water flow over time, downsampled to at most 500 steps (min/avg/max) |
+| `get_timeseries` | Power or water flow over time, downsampled to 500 steps by default, at most 2000 (min/avg/max per step) |
 | `get_baseload` | Standby power and water use per night (default 01:00-05:00), typical baseload, kWh per year and trend. Grouped per week or month for long ranges |
 | `get_data_info` | Rows, first and last reading, and gaps |
 | `query` | Any single read-only SQL statement (row limit, statement timeout). Cells are strings, numbers, booleans or null; times are local, and JSON or array values come back as their JSON text |
@@ -335,7 +338,8 @@ It also offers the resource `elva://schema`, describing the table and its units.
 in and out are local (`ELVA_TIMEZONE`, default `Europe/Stockholm`). Inputs accept
 `2026-11-22`, `2026-11`, `2026-11-22T14:00` or relative values like `-7d` and `-3mo`.
 
-**Setup** (on the machine with the database, after installing the service):
+**Setup** (on the machine with the database, once the service has run and created its
+table):
 
 1. **Create a read-only database role.** It may only `SELECT` from `measurement`:
    ```sh
@@ -375,8 +379,9 @@ at most `ELVA_QUERY_MAX_ROWS` rows, and only one statement is accepted per call.
 | `ELVA_QUERY_TIMEOUT` | `30s` | Maximum run time of one database statement |
 | `ELVA_QUERY_MAX_ROWS` | `1000` | Maximum rows returned by `query` |
 
-`elva-mcp-stdio -check` connects, shows what data exists and exits. `-version` prints
-the version. Logs go to stderr; most MCP clients show them in their logs.
+`elva-mcp-stdio -check` connects, shows what data exists and exits (exit code 1 for
+bad settings, 5 if the database can't be reached). `-version` prints the version.
+Logs go to stderr, one line per tool call; most MCP clients show them in their logs.
 
 ## Roadmap
 
@@ -385,6 +390,12 @@ the version. Logs go to stderr; most MCP clients show them in their logs.
 - [ ] Grafana dashboards
 - [x] systemd service with install, verify and uninstall scripts
 - [x] MCP server for AI assistants (`elva-mcp-stdio`)
+
+## Development
+
+See [AGENTS.md](AGENTS.md) for how the code is organised, how the RCU's web interface
+works, how to run the tests (including against a throwaway PostgreSQL) and the rules
+for changing ElVa.
 
 ## License
 

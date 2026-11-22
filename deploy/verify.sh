@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Check an ElVa installation: files, configuration, service state, a live check of
-# the RCU and the database, and recent warnings. Exits 1 if anything failed.
+# the RCU and the database, the optional MCP server, and recent warnings.
+# Exits 1 if anything failed.
 #
 #   sudo deploy/verify.sh
 #

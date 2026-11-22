@@ -56,14 +56,14 @@ keep anything specific to one installation out of this file.
 
 ## Build, test, run
 
-Requires Go 1.25 or newer (pgx needs it). If Go was installed from the tarball into a user directory
-such as `~/.local/go`, put it on the PATH, e.g. in `~/.bashrc`:
+Requires Go 1.25 or newer (pgx needs it). If Go was installed from the tarball into a
+user directory such as `~/.local/go`, put it on the PATH, e.g. in `~/.bashrc`:
 `export PATH="$HOME/.local/go/bin:$HOME/go/bin:$PATH"`. Otherwise you get
 `go: command not found`.
 
 ```sh
 go vet ./... && go test ./...
-go build -o bin/elva ./cmd/elva
+scripts/build.sh                                      # bin/elva and bin/elva-mcp-stdio, with version
 ./bin/elva -env-file .env.<name>                      # real RCU
 ELVA_INTERVAL=10s ./bin/elva -env-file .env.<name>    # faster, for manual testing only
 ```
@@ -116,7 +116,9 @@ written", and the table should have no gap.
   `docker logs`.
 - For a plain file, redirect: `2>> elva.log`, or systemd
   `StandardError=append:/var/log/elva.log`.
-- Normal scrapes log nothing; only startup, warnings and errors are logged.
+- `elva`: normal scrapes log nothing; only startup, warnings and errors are logged.
+- `elva-mcp-stdio`: startup, then one line per tool call (name, duration, error). Its
+  stdout is the MCP protocol, so it must never print anything else there.
 
 ## Layout
 
@@ -128,6 +130,7 @@ written", and the table should have no gap.
 | `cmd/elva/config.go` | The scraper's settings table and `parseConfig` |
 | `cmd/elva-mcp-stdio/main.go` | MCP server: settings, read-only database connection, `-check`, stdio transport |
 | `cmd/elva-mcp-stdio/tools.go` | Tool definitions and handlers, server instructions, the `elva://schema` resource |
+| `cmd/elva-mcp-stdio/schema.go` | `schemaFor`: portable JSON Schemas for tool inputs and outputs (rule 7) |
 | `cmd/elva-mcp-stdio/when.go` | Parses time inputs (`2026-11`, `-7d`, RFC 3339, ...) in local time |
 | `internal/config/config.go` | Shared settings machinery: env file, sources, secret masking, `-help` |
 | `internal/ktc/client.go` | HTTP client: `Login`, `ReadMeter`, `Cursor`, `SetCursor`; error kinds `ErrUnreachable`, `ErrAuth` |
@@ -144,7 +147,9 @@ written", and the table should have no gap.
 | `deploy/verify.sh` | Checks files, permissions, settings, unit drift, service state, then `elva -check`, last-row age, the MCP server (`-check`, group members) and journal warnings |
 | `deploy/mcp.env.sample` | Template for `PREFIX/mcp.env` |
 | `deploy/readonly-role.sql` | Creates the `SELECT`-only role `elva_ro` for the MCP server |
-| `deploy/uninstall.sh` | Removes the service and binary; `--purge` also removes `PREFIX` and the user. Never touches the database |
+| `deploy/uninstall.sh` | Removes the service and binaries, keeps `elva.env` and `mcp.env`; `--purge` also removes `PREFIX`, the user `elva` and the group `elva-mcp`. Never touches the database |
+| `.env.sample` | Template for the reader's settings, in the same order as its `settings` table |
+| `CLAUDE.md` | Makes Claude Code read this file (`CLAUDE.local.md`, git-ignored, can add `AGENTS_OWNER.md`) |
 
 ## How the RCU web UI works
 
@@ -289,6 +294,8 @@ CREATE TABLE IF NOT EXISTS measurement (
   The resource is `elva://schema`.
 - **Time:** `ELVA_TIMEZONE` sets the session time zone and the bucket boundaries;
   outputs are local RFC 3339.
+- **Exit codes** follow `elva`: 1 for bad settings, 5 if the database can't be reached
+  (or the role can't read `measurement`).
 - **Measured** on 3.1 M synthetic rows (6 years) with PostgreSQL 17: each tool takes
   1-3.5 s, and the largest answers are about 10 KB (month buckets) and 30 KB (500
   timeseries points).
@@ -298,12 +305,15 @@ CREATE TABLE IF NOT EXISTS measurement (
     web UI against the test database. Add `--cli --method tools/list` (or
     `tools/call --tool-name ... --tool-arg key=value`) for terminal use.
   - **Defaults:** the test container (`elva-test-pg`) with role `elva_ro`, password
-    `ro` (`deploy/readonly-role.sql`, run with `-v pw="'ro'"`). Override with
-    `ELVA_DATABASE_URL`; `ELVA_TEST_SCHEMA=perf` reads a schema of synthetic data.
+    `ro`. Override with `ELVA_DATABASE_URL`; `ELVA_TEST_SCHEMA=<schema>` reads another
+    schema, e.g. one filled with synthetic data.
+  - **Creating that role** needs the table to exist, so run `elva` against the
+    container once first. Then:
+    `docker exec -i elva-test-pg psql -U postgres -d elva -v pw="'ro'" -f - < deploy/readonly-role.sql`.
   - **Raw stdio:** pipe JSON-RPC lines into the binary (`initialize`,
     `notifications/initialized`, `tools/call`).
 
-**Grafana** reads directly from PostgreSQL.
+**Grafana (planned)** will read directly from PostgreSQL; no dashboards exist yet.
 
 **Deployment (implemented): a systemd service installed from a checkout.**
 - **Layout:** `/opt/elva` by default, with `PREFIX` to override.
@@ -327,14 +337,20 @@ CREATE TABLE IF NOT EXISTS measurement (
 **Testing the deploy scripts** without a real machine, in a throwaway systemd container:
 
 ```sh
-# image: debian:trixie + systemd systemd-sysv procps diffutils, CMD /sbin/init
+# once: an image with systemd as PID 1, and a network shared with the test database
+printf '%s\n' 'FROM debian:trixie' \
+  'RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv procps diffutils && rm -rf /var/lib/apt/lists/*' \
+  'STOPSIGNAL SIGRTMIN+3' 'CMD ["/sbin/init"]' | docker build -t elva-systemd-test -
 docker network create elva-test && docker network connect elva-test elva-test-pg
+
 docker run -d --name elva-sd --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
   --network elva-test elva-systemd-test
-# copy committed files only (never private ones), plus the binary built by scripts/build.sh
+# copy committed files only (never private ones), plus the binaries built by scripts/build.sh
 git archive HEAD | docker exec -i elva-sd sh -c 'mkdir -p /srv/elva && tar -xf - -C /srv/elva'
 docker cp bin/elva elva-sd:/srv/elva/bin/elva
+docker cp bin/elva-mcp-stdio elva-sd:/srv/elva/bin/elva-mcp-stdio
 docker exec -it elva-sd bash    # then: cd /srv/elva && deploy/install.sh && deploy/verify.sh ...
+docker rm -f elva-sd            # when done
 ```
 
 Use `ELVA_DATABASE_URL=postgres://postgres:test@elva-test-pg:5432/elva` inside the
@@ -344,4 +360,6 @@ container. Scenarios worth repeating after changing the scripts or the unit:
 - an upgrade keeps `elva.env` byte for byte;
 - a wrong password gives `failed` with 0 restarts;
 - the database paused at startup gives restarts, then recovers by itself;
+- MCP access: a user in group `elva-mcp` can run `elva-mcp-stdio -env-file
+  /opt/elva/mcp.env`, and a user outside it gets "permission denied";
 - uninstall, then `--purge`.

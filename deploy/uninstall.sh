@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remove the ElVa service. The settings file is kept unless --purge is given.
+# Remove the ElVa service and binaries. The settings files are kept unless --purge is given.
 # The database is never touched.
 #
 #   sudo deploy/uninstall.sh            # remove service and binaries, keep the *.env files
