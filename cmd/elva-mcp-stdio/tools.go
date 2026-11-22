@@ -34,8 +34,16 @@ periods like "last week", "senaste veckan" or "senaste månaden".
   coverage_pct and get_data_info before trusting averages or comparing periods.
 - earliest_data in every answer is the oldest stored reading: nothing exists before it,
   so a new installation may only have hours of data.
-- Prefer get_consumption, get_timeseries and get_baseload; use query for anything else,
-  and get_schema when a value looks off.`
+
+All seven tools (a keyword tool search may show only some of them):
+- get_latest: power and water flow right now, meter totals.
+- get_consumption: kWh and litres per hour, day, week, month or year, with peak power.
+- get_timeseries: power or water flow over time, for curves and finding when things happened.
+- get_baseload: standby and night use per night (nattförbrukning, baslast), water leaks.
+- get_data_info: what data exists and its gaps.
+- get_schema: the table and how consumption is computed; read it when a value looks off.
+- query: one read-only SQL SELECT, for anything the other tools don't cover.
+Prefer get_consumption, get_timeseries and get_baseload over query.`
 
 const schemaDoc = `# ElVa database
 

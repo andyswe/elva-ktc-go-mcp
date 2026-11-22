@@ -169,6 +169,11 @@ func TestTools(t *testing.T) {
 		if !tool.Annotations.ReadOnlyHint {
 			t.Errorf("%s not marked read-only", tool.Name)
 		}
+		// Clients that defer tools show only a few search hits, but always the
+		// instructions: every tool must be listed there.
+		if !strings.Contains(instructions, "- "+tool.Name+":") {
+			t.Errorf("%s is not listed in the server instructions", tool.Name)
+		}
 	}
 	if got := strings.Join(names, ","); got != "get_baseload,get_consumption,get_data_info,get_latest,get_schema,get_timeseries,query" {
 		t.Errorf("tools = %s", got)

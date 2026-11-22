@@ -316,6 +316,10 @@ CREATE TABLE IF NOT EXISTS measurement (
   the server instructions and tool descriptions name the Swedish words users ask
   with (el, elförbrukning, nattförbrukning, standby, toppeffekt, senaste veckan, ...)
   and say there is no other data source.
+  - The search is the client's, not the server's, and often returns only the top
+    few hits (5 by default in one client), so a tool can match and still not be shown. The instructions therefore
+    list every tool with one line each, and `TestTools` fails if a tool is missing
+    from that list. Add new tools there too.
 - **Time:** `ELVA_TIMEZONE` sets the session time zone and the bucket boundaries;
   outputs are local RFC 3339.
 - **Exit codes** follow `elva`: 1 for bad settings, 5 if the database can't be reached

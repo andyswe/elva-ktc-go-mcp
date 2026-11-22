@@ -348,8 +348,9 @@ Every answer except `query` and `get_schema` includes `earliest_data`, the oldes
 reading, so it is obvious when a new database only holds a few hours; a range that
 starts before it gets a note. The tool descriptions include Swedish words (el,
 elförbrukning, nattförbrukning, toppeffekt, senaste veckan, ...) so that clients that
-search tools by keyword find them. Times
-in and out are local (`ELVA_TIMEZONE`, default `Europe/Stockholm`). Inputs accept
+search tools by keyword find them. Such searches often return only the first few
+hits, so the server instructions, which clients always show, also list all seven
+tools. Times in and out are local (`ELVA_TIMEZONE`, default `Europe/Stockholm`). Inputs accept
 `2026-11-22`, `2026-11`, `2026-11-22T14:00` or relative values like `-7d` and `-3mo`.
 
 **Setup** (on the machine with the database, once the service has run and created its
