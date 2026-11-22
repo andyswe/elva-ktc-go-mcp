@@ -63,6 +63,8 @@ One table, one row per minute (older imported data may be irregular):
       SELECT date_trunc('day', time) AS day, (max(el_energy) - min(el_energy)) / 1000.0
       FROM measurement GROUP BY 1 ORDER BY 1;
   (min/max within a period misses the minute before it; get_consumption is exact.)
+- For night-time or standby use (baseload) and water leaks, use get_baseload rather
+  than SQL.
 - The query tool runs in a read-only transaction whose session time zone is %s, so
   date_trunc and casts to date use local time.
 `
@@ -105,7 +107,8 @@ func newServer(log *slog.Logger, s *server) *mcp.Server {
 		Description: "Electricity (kWh) and water (litres) used per hour, day, week, month or year " +
 			"(elförbrukning, vattenförbrukning, e.g. last week, senaste veckan, senaste månaden), computed from the " +
 			"meter totals (correct across DST; consumption during outages over an hour is listed separately under gaps), with average and peak power (toppeffekt) per period. " +
-			"Buckets follow local calendar periods; weeks start on Monday."},
+			"Buckets follow local calendar periods; weeks start on Monday. " +
+			"For night-time or standby use (nattförbrukning, standby, baslast) or water leaks, use get_baseload."},
 		s.consumption)
 	add(log, srv, &mcp.Tool{Name: "get_timeseries", Annotations: ro,
 		Description: "Power (W, effekt) or water flow (l/h) over time, downsampled to at most max_points steps with min/avg/max per step. " +
