@@ -58,6 +58,8 @@ other secrets are masked, including passwords inside connection URLs.
 | `KTC_METERS` | all meters | Comma-separated meter names to read, e.g. `EL-01,VV-01` |
 | `ELVA_INTERVAL` | `1m` | Scrape interval, aligned to the wall clock (whole minutes) |
 | `ELVA_TIMEOUT` | `10s` | Timeout per HTTP request to the RCU |
+| `KTC_TIMEZONE` | `Europe/Stockholm` | Time zone of the RCU's clock; its timestamps carry none |
+| `ELVA_MAX_METER_AGE` | `2m` | Warn when the RCU's last read of a meter is older than this |
 
 The RCU itself reads the meters once a minute, so an interval shorter than `1m` only
 repeats the same values.
@@ -75,8 +77,16 @@ repeats the same values.
    | 4 | Anything else, e.g. a name in `KTC_METERS` doesn't exist |
 
 2. **Every minute**, ElVa reads all meters and prints one JSON line to stdout. Logs go
-   to stderr. A failed scrape is logged and retried on the next minute, so a rebooting
-   RCU or a network glitch doesn't stop the service.
+   to stderr; ElVa has no log file of its own. Under systemd they end up in the journal
+   (`journalctl -u elva`), and in a container they go to `docker logs`. A failed scrape
+   is logged and retried on the next minute, so a rebooting RCU or a network glitch
+   doesn't stop the service.
+
+3. **Each reading is checked for freshness.** The RCU reads every meter about once a
+   minute, so its last read is normally 0-60 s old. If it is older than
+   `ELVA_MAX_METER_AGE`, or in the future, ElVa logs a warning but still uses the
+   reading. Totals stay correct anyway; only the momentary power or flow may be
+   outdated. A warning on every scrape usually means `KTC_TIMEZONE` is wrong.
 
 ### Output format
 
@@ -101,7 +111,8 @@ explanations (real output has no comments). It was taken at 13:28 on 22 November
       "meter_id": "12345678",
       // When the RCU last read this meter over M-Bus. The RCU does this about once a
       // minute on its own schedule, so the value is 0-60 s older than "time". If it
-      // stops advancing, the RCU has lost contact with the meter.
+      // stops advancing, the RCU has lost contact with the meter, and ElVa logs a
+      // warning (see ELVA_MAX_METER_AGE).
       "meter_time": "2026-11-22T13:28:13+01:00",
       // Result of the RCU's last M-Bus read. "OK" when healthy; anything else is
       // logged as a warning.
@@ -188,7 +199,7 @@ Possible `quantity`/`unit` pairs, depending on how a meter is set up on the RCU:
 ## Roadmap
 
 - [x] Read electricity and water from the RCU; startup connectivity and auth check
-- [ ] Store in PostgreSQL (schema compatible with v1's `elva` table)
+- [ ] Store in PostgreSQL
 - [ ] Grafana dashboards
 - [ ] Container or systemd deployment
 

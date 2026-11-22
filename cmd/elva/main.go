@@ -20,6 +20,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata" // KTC_TIMEZONE must resolve even where the OS has no zone database
 
 	"github.com/andyswe/elva-ktc-2/internal/ktc"
 )
@@ -63,7 +64,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := ktc.New(cfg.host, cfg.password, cfg.timeout)
+	client := ktc.New(cfg.host, cfg.password, cfg.timeout, cfg.loc)
 	meters, err := startupCheck(ctx, log, client, cfg)
 	if err != nil {
 		switch {
@@ -90,7 +91,7 @@ func main() {
 			return
 		case <-time.After(time.Until(next)):
 		}
-		m, err := scrape(ctx, log, client, meters, next)
+		m, err := scrape(ctx, log, client, meters, next, cfg.maxMeterAge)
 		if err != nil {
 			// Transient errors (RCU rebooting, Wi-Fi hiccup) must not kill the service.
 			log.Warn("scrape failed", "err", err)
@@ -129,7 +130,7 @@ func startupCheck(ctx context.Context, log *slog.Logger, c *ktc.Client, cfg conf
 		log.Info("found meter", "name", m.Name, "object", fmt.Sprintf("MB%d", m.Pos), "value", m.Value)
 	}
 
-	if _, err := scrape(ctx, log, c, meters, time.Now()); err != nil {
+	if _, err := scrape(ctx, log, c, meters, time.Now(), cfg.maxMeterAge); err != nil {
 		return nil, fmt.Errorf("test read: %w", err)
 	}
 	log.Info("test read OK")
@@ -145,7 +146,7 @@ type Measurement struct {
 // scrape logs in (the RCU session times out, and login is a single cheap request)
 // and reads every meter. The RCU's M-Bus cursor is shared with other web UI users,
 // so it is restored to where we found it afterwards.
-func scrape(ctx context.Context, log *slog.Logger, c *ktc.Client, meters []ktc.MeterRef, at time.Time) (*Measurement, error) {
+func scrape(ctx context.Context, log *slog.Logger, c *ktc.Client, meters []ktc.MeterRef, at time.Time, maxMeterAge time.Duration) (*Measurement, error) {
 	if _, err := c.Login(ctx); err != nil {
 		return nil, err
 	}
@@ -174,9 +175,28 @@ func scrape(ctx context.Context, log *slog.Logger, c *ktc.Client, meters []ktc.M
 		if r.CommStatus != "OK" {
 			log.Warn("RCU reports meter communication problem", "meter", r.Name, "status", r.CommStatus, "meter_time", r.MeterTime)
 		}
+		if problem := meterAgeProblem(time.Now(), r.MeterTime, maxMeterAge); problem != "" {
+			// The reading is still used: totals stay correct, only the rate may be outdated.
+			log.Warn(problem, "meter", r.Name, "meter_time", r.MeterTime, "max_age", maxMeterAge)
+		}
 		m.Meters = append(m.Meters, r)
 	}
 	return m, nil
+}
+
+// meterAgeProblem checks how long ago the RCU last read a meter. The RCU reads every
+// meter about once a minute, so a healthy reading is 0-60 s old. It returns "" when fine.
+func meterAgeProblem(now, meterTime time.Time, maxAge time.Duration) string {
+	age := now.Sub(meterTime)
+	switch {
+	case meterTime.IsZero():
+		return "RCU reports no time for its last read of the meter"
+	case age > maxAge:
+		return fmt.Sprintf("stale meter reading: RCU last read the meter %s ago (if constant, check KTC_TIMEZONE and the RCU clock)", age.Round(time.Second))
+	case age < -maxAge:
+		return fmt.Sprintf("meter reading is %s in the future: check KTC_TIMEZONE and the RCU clock", (-age).Round(time.Second))
+	}
+	return ""
 }
 
 func meterNames(ms []ktc.MeterRef) string {

@@ -71,7 +71,7 @@ type MeterReading struct {
 	Pos        int       `json:"pos"`
 	Name       string    `json:"name"`
 	MeterID    string    `json:"meter_id"`
-	MeterTime  time.Time `json:"meter_time"` // when the RCU last talked to the meter (RCU local time)
+	MeterTime  time.Time `json:"meter_time"` // when the RCU last read the meter; zero if unknown
 	CommStatus string    `json:"comm_status"`
 	Values     []Value   `json:"values"`
 	// Consumption per period, in the unit of Value1. Nil when the RCU reports "---".
@@ -114,7 +114,8 @@ var vifUnits = map[int][2]string{
 
 const vifNone = 1536
 
-func parseMeterXML(body []byte) (*MeterReading, error) {
+// parseMeterXML parses /mb.xml. loc is the RCU's time zone: its timestamps carry none.
+func parseMeterXML(body []byte, loc *time.Location) (*MeterReading, error) {
 	var doc struct {
 		XMLName xml.Name `xml:"data"`
 		Fields  []struct {
@@ -143,7 +144,7 @@ func parseMeterXML(body []byte) (*MeterReading, error) {
 		MeterID:    f["DBIpMB1_Id"],
 		CommStatus: f["DBIMB1_CommInfo"],
 	}
-	if t, err := time.ParseInLocation("2006-01-02 15:04:05", f["DBIMB1_Time"], time.Local); err == nil {
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", f["DBIMB1_Time"], loc); err == nil {
 		r.MeterTime = t
 	}
 	for i := 1; i <= 6; i++ {

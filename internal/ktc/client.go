@@ -39,11 +39,13 @@ var ErrUnreachable = errors.New("KTC unreachable")
 type Client struct {
 	baseURL  string
 	password string
+	loc      *time.Location
 	http     *http.Client
 }
 
 // New returns a client for the RCU at host (host or host:port, optionally with scheme).
-func New(host, password string, timeout time.Duration) *Client {
+// loc is the time zone the RCU's clock runs in.
+func New(host, password string, timeout time.Duration, loc *time.Location) *Client {
 	base := host
 	if !strings.Contains(base, "://") {
 		base = "http://" + base
@@ -51,6 +53,7 @@ func New(host, password string, timeout time.Duration) *Client {
 	return &Client{
 		baseURL:  strings.TrimRight(base, "/"),
 		password: password,
+		loc:      loc,
 		http:     &http.Client{Timeout: timeout},
 	}
 }
@@ -114,7 +117,7 @@ func (c *Client) readMB(ctx context.Context, form url.Values, what string) (*Met
 	if isLoginPage(body) {
 		return nil, fmt.Errorf("reading %s: session not authenticated: %w", what, ErrAuth)
 	}
-	r, err := parseMeterXML(body)
+	r, err := parseMeterXML(body, c.loc)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", what, err)
 	}

@@ -26,16 +26,20 @@ var settings = []setting{
 	{name: "KTC_HOST", required: true, help: "host or host:port of the KTC RCU, e.g. 192.168.1.100"},
 	{name: "KTC_PASSWORD", required: true, secret: true, help: "RCU web UI login password"},
 	{name: "KTC_METERS", help: "comma-separated meter names to read, e.g. EL-01,VV-01 (default: all meters on the RCU)"},
+	{name: "KTC_TIMEZONE", def: "Europe/Stockholm", help: "time zone of the RCU clock (its timestamps carry none)"},
 	{name: "ELVA_INTERVAL", def: "1m", help: "scrape interval, aligned to the wall clock"},
 	{name: "ELVA_TIMEOUT", def: "10s", help: "timeout per HTTP request to the RCU"},
+	{name: "ELVA_MAX_METER_AGE", def: "2m", help: "warn when the RCU's last read of a meter is older than this (the reading is still used)"},
 }
 
 type config struct {
-	host     string
-	password string
-	meters   []string
-	interval time.Duration
-	timeout  time.Duration
+	host        string
+	password    string
+	meters      []string
+	loc         *time.Location
+	interval    time.Duration
+	timeout     time.Duration
+	maxMeterAge time.Duration
 }
 
 // resolved is a setting's effective value and where it came from.
@@ -118,13 +122,18 @@ func parseConfig(rs []resolved) (config, error) {
 	for _, d := range []struct {
 		name string
 		dst  *time.Duration
-	}{{"ELVA_INTERVAL", &cfg.interval}, {"ELVA_TIMEOUT", &cfg.timeout}} {
+	}{{"ELVA_INTERVAL", &cfg.interval}, {"ELVA_TIMEOUT", &cfg.timeout}, {"ELVA_MAX_METER_AGE", &cfg.maxMeterAge}} {
 		dur, err := time.ParseDuration(v[d.name])
 		if err != nil || dur <= 0 {
 			return cfg, fmt.Errorf("%s=%q: must be a positive duration like 1m or 30s", d.name, v[d.name])
 		}
 		*d.dst = dur
 	}
+	loc, err := time.LoadLocation(v["KTC_TIMEZONE"])
+	if err != nil {
+		return cfg, fmt.Errorf("KTC_TIMEZONE=%q: %v", v["KTC_TIMEZONE"], err)
+	}
+	cfg.loc = loc
 	return cfg, nil
 }
 

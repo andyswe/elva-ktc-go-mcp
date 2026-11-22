@@ -3,6 +3,10 @@
 Guide for anyone, human or AI agent, maintaining ElVa. User-facing documentation is in
 [README.md](README.md).
 
+A maintainer's local, private notes (machines, credentials, deployment specifics) go in
+`AGENTS_OWNER.md`, which is git-ignored. If it exists, read it too. Never commit it, and
+keep anything specific to one installation out of this file.
+
 ## Rules
 
 1. **Keep the docs current.** Every change that affects behaviour, configuration,
@@ -17,8 +21,10 @@ Guide for anyone, human or AI agent, maintaining ElVa. User-facing documentation
    - Always restore the shared M-Bus cursor after a scrape (`scrape()` in `cmd/elva/main.go`).
    - Read at most once a minute, with requests sent one at a time. The RCU is a small
      embedded device and closes the connection after every response.
-3. **Never commit secrets.** `.env.*` is git-ignored except `.env.sample`. Keep local
-   settings in a personal file such as `.env.<name>`. Tests use the fake password `secret`.
+3. **Never commit secrets or private notes.** Git ignores `.env.*` (except `.env.sample`),
+   `AGENTS_OWNER.md` and `CLAUDE.local.md`. Keep local settings in a personal file such
+   as `.env.<name>`. Tests use the fake password `secret`, and test fixtures must not
+   contain real names, serial numbers or addresses.
 4. Use the standard library only, unless a dependency clearly pays for itself.
 5. **Define every setting in the `settings` table in `cmd/elva/config.go`.** Don't call
    `os.Getenv` anywhere else. The table drives `-help` and the startup settings log,
@@ -55,20 +61,30 @@ unused IP gives exit 2, and a wrong `KTC_PASSWORD` gives exit 3.
   `export ` prefix and surrounding quotes. It has no multi-line values or escape
   sequences.
 
+### Logging
+
+- Logs go to the console only (`log/slog` text to stderr), with no log-file option
+  in ElVa.
+- The supervisor stores and rotates them: systemd's journal (`journalctl -u elva`) or
+  `docker logs`.
+- For a plain file, redirect: `2>> elva.log`, or systemd
+  `StandardError=append:/var/log/elva.log`.
+- Normal scrapes log nothing; only startup, warnings and errors are logged.
+
 ## Layout
 
 | Path | Contents |
 |------|----------|
-| `cmd/elva/main.go` | Startup check, minute loop, cursor restore, JSON output |
+| `cmd/elva/main.go` | Startup check, minute loop, cursor restore, meter freshness check (`meterAgeProblem`), JSON output |
 | `cmd/elva/config.go` | Settings table, `-env-file` loader, value sources, secret masking, `-help` text |
 | `internal/ktc/client.go` | HTTP client: `Login`, `ReadMeter`, `Cursor`, `SetCursor`; error kinds `ErrUnreachable`, `ErrAuth` |
 | `internal/ktc/parse.go` | Start page and `mb.xml` parsing, VIF unit table |
-| `internal/ktc/testdata/` | Real responses captured from an RCU1111-1100 (firmware 4.7.13) |
+| `internal/ktc/testdata/` | Anonymized responses captured from an RCU1111-1100 (firmware 4.7.13) |
 | `internal/ktc/ktc_test.go` | Parser tests and a fake RCU (`newFakeRCU`) that models the session and cursor |
 
 ## How the RCU web UI works
 
-Tested on RCU1111-1100, firmware 4.7.13. Reference: KTC user manual part 2 (linked from v1's README).
+Tested on RCU1111-1100, firmware 4.7.13. Reference: [KTC user manual part 2](https://docs.ktc.se/media/duc-manualer/Anvandarmanual%20del%202,%20KTC-RCU1111,%20SW-4.3.00,%20T-V%202013-08-13.%20Peo%20Sandberg-Sanna%20Fager%20KTC%20TECH.pdf).
 
 - **Encoding:** every response is ISO-8859-1. `post()` converts it to UTF-8, and the
   XML decoder ignores the encoding declaration.
@@ -92,13 +108,14 @@ Tested on RCU1111-1100, firmware 4.7.13. Reference: KTC user manual part 2 (link
     - The response's `<counter>` element is the slot index (N-1).
     - No read leaves the cursor untouched, so `Cursor()` steps next and then prev. The
       two steps cancel out and the second response reveals the original position.
-      Restoring is `pos=orig`. Both were verified on the device, including at the
-      MB08 wrap edge.
+      Restoring is `pos=orig`. Both were verified on a device, including at the MB08
+      wrap edge.
   - Main fields: `mbPos` (`MB03`), `DBIpMB1_Txt` (name), `DBIMB1_Value1..6`,
     `DBIpMB1_VIFList1..6` (unit code for each value), `DBIMB1_Current/Prev{Hour,Day,Month}`,
-    `DBIMB1_Time` (last time the RCU read the meter, in RCU local time),
+    `DBIMB1_Time` (last time the RCU read the meter, in RCU local time with no zone;
+    parsed with `KTC_TIMEZONE`),
     `DBIMB1_CommInfo` (`OK` when healthy), `DBIpMB1_Id` (meter serial number).
-  - Empty values are `---`. Empty slots MB4 and up return `---` for everything.
+  - Empty values are `---`. Empty slots return `---` for everything.
   - VIF unit codes come from the `<select>` options in `mb.htm`: 1536 none, 1537 Wh,
     1538 kWh, 1540 l, 1541 m3, 1543 W, 1544 kW, 1545 l/h, 1546 m3/h, and so on
     (`vifUnits` in `parse.go`).
@@ -135,30 +152,49 @@ curl -s -d "part=3&passwd=$KTC_PASSWORD" $H/index.htm > /dev/null
 curl -s -d pos=1 $H/mb.xml > internal/ktc/testdata/mb1_water.xml   # then pos=3, pos=5
 ```
 
-Afterwards, update the expected values in `ktc_test.go`. The fake RCU in that file
-models the cursor semantics above, so keep it in sync if the device turns out to
+Before committing new fixtures, **anonymize them** (rule 3): replace the RCU name
+(`Namn`) and the meter serial numbers (`DBIpMB1_Id`, `DBIpMB1_MeterId`) with
+placeholders. Then update the expected values in `ktc_test.go`. The fake RCU in that
+file models the cursor semantics above, so keep it in sync if the device turns out to
 behave differently.
 
-## Roadmap and planned design
+## Roadmap and design decisions
 
-**Database (next step).** Stay compatible with v1's table so old data and queries keep
-working:
+**Database (next step).** PostgreSQL schema:
 
 ```sql
-CREATE TABLE IF NOT EXISTS elva (date TIMESTAMP PRIMARY KEY, power INT, el INT, va INT);
--- power = EL momentary W, el = EL total Wh, va = water total l
+CREATE TABLE IF NOT EXISTS measurement (
+    time       timestamptz PRIMARY KEY,  -- scrape time, whole minutes
+    el_energy  bigint,                   -- electricity meter total, Wh
+    el_power   integer,                  -- electricity momentary power, W
+    va_volume  bigint,                   -- water meter total, l
+    va_flow    real                      -- water momentary flow, l/h
+);
 ```
 
-Planned additions are nullable columns, so v1 rows remain valid:
-- `va_flow` (l/h)
-- the meter timestamps, so stale readings can be spotted
+- **Naming:** `<meter>_<quantity>`. Totals (energy, volume) and rates (power, flow) are
+  named alike for both meters.
+- **Mapping:** meters are assigned to columns by quantity. The energy/power meter
+  fills `el_*`, the volume/flow meter fills `va_*`. Two meters of the same kind is a
+  startup error.
+- **Writes:** `INSERT ... ON CONFLICT (time) DO NOTHING`, so a restart within the same
+  minute is harmless. All value columns are nullable: one meter may fail while the
+  other works, and imported historical data may lack some columns.
+- **`timestamptz`, not `timestamp`.**
+  - A `timestamp` stores a wall-clock reading without a zone, so the zone it was
+    written in is lost.
+  - In autumn, 02:00-02:59 local time happens twice and can't be told apart.
+  - Grafana treats a `timestamp` as UTC, so local values are drawn 1-2 h off.
+  - `timestamptz` stores an exact moment, which fixes all of this.
+- **Not stored:**
+  - the RCU's per-period values (`current_hour` and so on), which can be computed
+    from the totals, e.g. `max(el_energy) - min(el_energy)` per day;
+  - `comm_status` and `meter_time`. Freshness is checked at scrape time and logged
+    as a warning instead (`meterAgeProblem`, `ELVA_MAX_METER_AGE`).
+- **Scale:** about 525 k rows per year. Plain PostgreSQL with the primary key index is
+  enough; no TimescaleDB or extra indexes are needed.
 
-Open question: v1 used `TIMESTAMP` without a time zone as the primary key. Local time
-repeats during the autumn DST change, which causes PK collisions for one hour a year.
-`TIMESTAMPTZ` fixes this and existing queries keep working. Decide this when
-implementing the database.
-
-**Grafana** will read directly from PostgreSQL, replacing v1's JSP frontend.
+**Grafana** reads directly from PostgreSQL.
 
 **Deployment:** not decided yet. Options are a systemd unit running the static binary,
-or docker compose alongside PostgreSQL and Grafana, as v1 did.
+or docker compose alongside PostgreSQL and Grafana.

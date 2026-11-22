@@ -3,3 +3,6 @@
 .env
 .env.*
 !.env.sample
+# Private, installation-specific notes (see AGENTS.md)
+AGENTS_OWNER.md
+CLAUDE.local.md

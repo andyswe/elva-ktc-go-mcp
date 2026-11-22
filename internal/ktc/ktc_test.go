@@ -51,7 +51,7 @@ func TestIsLoginPage(t *testing.T) {
 }
 
 func TestParseMeterXML(t *testing.T) {
-	el, err := parseMeterXML(fixture(t, "mb3_el.xml"))
+	el, err := parseMeterXML(fixture(t, "mb3_el.xml"), time.UTC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestParseMeterXML(t *testing.T) {
 		t.Error("el meter time not parsed")
 	}
 
-	w, err := parseMeterXML(fixture(t, "mb1_water.xml"))
+	w, err := parseMeterXML(fixture(t, "mb1_water.xml"), time.UTC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestParseMeterXML(t *testing.T) {
 		t.Errorf("water flow = %+v %v", v, ok)
 	}
 
-	empty, err := parseMeterXML(fixture(t, "mb5_empty.xml"))
+	empty, err := parseMeterXML(fixture(t, "mb5_empty.xml"), time.UTC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,14 +155,14 @@ func TestClient(t *testing.T) {
 	defer srv.Close()
 	ctx := context.Background()
 
-	if _, err := New(srv.URL, "wrong", time.Second).Login(ctx); !errors.Is(err, ErrAuth) {
+	if _, err := New(srv.URL, "wrong", time.Second, time.UTC).Login(ctx); !errors.Is(err, ErrAuth) {
 		t.Errorf("wrong password: err = %v, want ErrAuth", err)
 	}
-	if _, err := New(srv.URL, "wrong", time.Second).ReadMeter(ctx, 3); !errors.Is(err, ErrAuth) {
+	if _, err := New(srv.URL, "wrong", time.Second, time.UTC).ReadMeter(ctx, 3); !errors.Is(err, ErrAuth) {
 		t.Errorf("read without login: err = %v, want ErrAuth", err)
 	}
 
-	c := New(srv.URL, "secret", time.Second)
+	c := New(srv.URL, "secret", time.Second, time.UTC)
 	p, err := c.Login(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +186,7 @@ func TestCursorSaveRestore(t *testing.T) {
 	srv := newFakeRCU(t)
 	defer srv.Close()
 	ctx := context.Background()
-	c := New(srv.URL, "secret", time.Second)
+	c := New(srv.URL, "secret", time.Second, time.UTC)
 	if _, err := c.Login(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestClientUnreachable(t *testing.T) {
 	srv := newFakeRCU(t)
 	url := srv.URL
 	srv.Close()
-	if _, err := New(url, "secret", time.Second).Login(context.Background()); !errors.Is(err, ErrUnreachable) {
+	if _, err := New(url, "secret", time.Second, time.UTC).Login(context.Background()); !errors.Is(err, ErrUnreachable) {
 		t.Errorf("err = %v, want ErrUnreachable", err)
 	}
 }
