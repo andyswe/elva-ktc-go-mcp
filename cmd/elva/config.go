@@ -28,8 +28,10 @@ var settings = []setting{
 	{name: "KTC_METERS", help: "comma-separated meter names to read, e.g. EL-01,VV-01 (default: all meters on the RCU)"},
 	{name: "KTC_TIMEZONE", def: "Europe/Stockholm", help: "time zone of the RCU clock (its timestamps carry none)"},
 	{name: "ELVA_INTERVAL", def: "1m", help: "scrape interval, aligned to the wall clock"},
-	{name: "ELVA_TIMEOUT", def: "10s", help: "timeout per HTTP request to the RCU"},
+	{name: "ELVA_TIMEOUT", def: "10s", help: "timeout per request to the RCU and per database operation"},
 	{name: "ELVA_MAX_METER_AGE", def: "2m", help: "warn when the RCU's last read of a meter is older than this (the reading is still used)"},
+	{name: "ELVA_DATABASE_URL", help: "PostgreSQL URL, e.g. postgres://elva:pw@localhost:5432/elva (unset: print JSON to stdout instead)"},
+	{name: "ELVA_DATABASE_BUFFER", def: "168h", help: "how long to keep rows in memory while the database is unreachable"},
 }
 
 type config struct {
@@ -40,6 +42,8 @@ type config struct {
 	interval    time.Duration
 	timeout     time.Duration
 	maxMeterAge time.Duration
+	dbURL       string
+	dbBuffer    time.Duration
 }
 
 // resolved is a setting's effective value and where it came from.
@@ -113,7 +117,7 @@ func parseConfig(rs []resolved) (config, error) {
 	if len(missing) > 0 {
 		return cfg, fmt.Errorf("missing required setting(s): %s", strings.Join(missing, ", "))
 	}
-	cfg.host, cfg.password = v["KTC_HOST"], v["KTC_PASSWORD"]
+	cfg.host, cfg.password, cfg.dbURL = v["KTC_HOST"], v["KTC_PASSWORD"], v["ELVA_DATABASE_URL"]
 	for _, n := range strings.Split(v["KTC_METERS"], ",") {
 		if n = strings.TrimSpace(n); n != "" {
 			cfg.meters = append(cfg.meters, n)
@@ -122,7 +126,7 @@ func parseConfig(rs []resolved) (config, error) {
 	for _, d := range []struct {
 		name string
 		dst  *time.Duration
-	}{{"ELVA_INTERVAL", &cfg.interval}, {"ELVA_TIMEOUT", &cfg.timeout}, {"ELVA_MAX_METER_AGE", &cfg.maxMeterAge}} {
+	}{{"ELVA_INTERVAL", &cfg.interval}, {"ELVA_TIMEOUT", &cfg.timeout}, {"ELVA_MAX_METER_AGE", &cfg.maxMeterAge}, {"ELVA_DATABASE_BUFFER", &cfg.dbBuffer}} {
 		dur, err := time.ParseDuration(v[d.name])
 		if err != nil || dur <= 0 {
 			return cfg, fmt.Errorf("%s=%q: must be a positive duration like 1m or 30s", d.name, v[d.name])
@@ -176,6 +180,6 @@ func printSettingsHelp(w io.Writer) {
 		case s.def != "":
 			extra = " (default " + s.def + ")"
 		}
-		fmt.Fprintf(w, "  %-14s %s%s\n", s.name, s.help, extra)
+		fmt.Fprintf(w, "  %-21s %s%s\n", s.name, s.help, extra)
 	}
 }

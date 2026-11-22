@@ -1,10 +1,11 @@
-// Command elva reads electricity and water meters from a KTC RCU every minute.
+// Command elva reads electricity and water meters from a KTC RCU every minute and
+// stores them in PostgreSQL (or prints them as JSON lines when no database is set).
 //
 // Configuration is read from the environment, optionally loaded from a file with
 // -env-file (variables already set in the environment win). All settings are
 // defined in config.go and logged at startup with secrets masked.
 //
-// Logs go to stderr; one JSON line per scrape goes to stdout.
+// Logs go to stderr.
 package main
 
 import (
@@ -23,6 +24,7 @@ import (
 	_ "time/tzdata" // KTC_TIMEZONE must resolve even where the OS has no zone database
 
 	"github.com/andyswe/elva-ktc-2/internal/ktc"
+	"github.com/andyswe/elva-ktc-2/internal/store"
 )
 
 // Exit codes, so a supervisor can tell why startup failed.
@@ -31,6 +33,7 @@ const (
 	exitUnreachable = 2
 	exitAuth        = 3
 	exitOther       = 4
+	exitDatabase    = 5
 )
 
 func main() {
@@ -64,8 +67,27 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var db *store.Store
+	if cfg.dbURL != "" {
+		octx, cancel := context.WithTimeout(ctx, cfg.timeout)
+		db, err = store.Open(octx, cfg.dbURL)
+		cancel()
+		if errors.Is(err, store.ErrConfig) {
+			log.Error("invalid ELVA_DATABASE_URL", "err", err)
+			os.Exit(exitConfig)
+		}
+		if err != nil {
+			log.Error("cannot connect to database: check ELVA_DATABASE_URL and that PostgreSQL is running", "err", err)
+			os.Exit(exitDatabase)
+		}
+		defer db.Close()
+		log.Info("connected to database, table measurement ready")
+	} else {
+		log.Info("ELVA_DATABASE_URL not set: printing measurements as JSON to stdout")
+	}
+
 	client := ktc.New(cfg.host, cfg.password, cfg.timeout, cfg.loc)
-	meters, err := startupCheck(ctx, log, client, cfg)
+	meters, first, err := startupCheck(ctx, log, client, cfg)
 	if err != nil {
 		switch {
 		case errors.Is(err, ktc.ErrUnreachable):
@@ -79,8 +101,17 @@ func main() {
 			os.Exit(exitOther)
 		}
 	}
+	if db != nil {
+		if _, err := toRow(first); err != nil {
+			log.Error("cannot map meters to database columns", "err", err)
+			os.Exit(exitOther)
+		}
+		log.Info("storing", "columns", storedColumns(first))
+	}
 
 	out := json.NewEncoder(os.Stdout)
+	buf := &buffer{max: max(1, int(cfg.dbBuffer/cfg.interval))}
+	dbDown := false
 	log.Info("started, scraping", "interval", cfg.interval)
 	for {
 		// Align to wall-clock boundaries (e.g. every whole minute) for tidy time series.
@@ -88,6 +119,13 @@ func main() {
 		select {
 		case <-ctx.Done():
 			log.Info("shutting down")
+			if db != nil && len(buf.rows) > 0 {
+				fctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+				if _, err := buf.flush(fctx, db.Insert); err != nil {
+					log.Error("database unreachable at shutdown: buffered rows lost", "rows", len(buf.rows), "err", err)
+				}
+				cancel()
+			}
 			return
 		case <-time.After(time.Until(next)):
 		}
@@ -97,18 +135,42 @@ func main() {
 			log.Warn("scrape failed", "err", err)
 			continue
 		}
-		if err := out.Encode(m); err != nil {
-			log.Error("writing measurement", "err", err)
+		if db == nil {
+			if err := out.Encode(m); err != nil {
+				log.Error("writing measurement", "err", err)
+			}
+			continue
+		}
+		row, err := toRow(m)
+		if err != nil {
+			log.Warn("cannot map measurement to database columns", "err", err)
+			continue
+		}
+		if dropped := buf.add(row); dropped > 0 {
+			log.Error("database buffer full: dropped oldest rows", "dropped", dropped, "buffer", cfg.dbBuffer)
+		}
+		wctx, cancel := context.WithTimeout(ctx, cfg.timeout)
+		written, err := buf.flush(wctx, db.Insert)
+		cancel()
+		switch {
+		case err != nil:
+			// Keep the rows and retry on the next tick; totals stay correct across gaps anyway.
+			log.Warn("database write failed, buffering", "buffered", len(buf.rows), "err", err)
+			dbDown = true
+		case dbDown:
+			log.Info("database reachable again, buffered rows written", "rows", written)
+			dbDown = false
 		}
 	}
 }
 
 // startupCheck logs in, discovers meters and does one full read, so that
 // configuration problems surface immediately rather than a minute later.
-func startupCheck(ctx context.Context, log *slog.Logger, c *ktc.Client, cfg config) ([]ktc.MeterRef, error) {
+// It returns the meters to read and the test measurement.
+func startupCheck(ctx context.Context, log *slog.Logger, c *ktc.Client, cfg config) ([]ktc.MeterRef, *Measurement, error) {
 	page, err := c.Login(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	log.Info("logged in to KTC", "url", c.BaseURL(), "model", page.Model, "version", page.Version, "name", page.Name)
 
@@ -118,23 +180,24 @@ func startupCheck(ctx context.Context, log *slog.Logger, c *ktc.Client, cfg conf
 		for _, want := range cfg.meters {
 			i := slices.IndexFunc(page.Meters, func(m ktc.MeterRef) bool { return m.Name == want })
 			if i < 0 {
-				return nil, fmt.Errorf("meter %q from KTC_METERS not found on RCU (available: %s)", want, meterNames(page.Meters))
+				return nil, nil, fmt.Errorf("meter %q from KTC_METERS not found on RCU (available: %s)", want, meterNames(page.Meters))
 			}
 			meters = append(meters, page.Meters[i])
 		}
 	}
 	if len(meters) == 0 {
-		return nil, errors.New("RCU start page lists no meters")
+		return nil, nil, errors.New("RCU start page lists no meters")
 	}
 	for _, m := range meters {
 		log.Info("found meter", "name", m.Name, "object", fmt.Sprintf("MB%d", m.Pos), "value", m.Value)
 	}
 
-	if _, err := scrape(ctx, log, c, meters, time.Now(), cfg.maxMeterAge); err != nil {
-		return nil, fmt.Errorf("test read: %w", err)
+	first, err := scrape(ctx, log, c, meters, time.Now(), cfg.maxMeterAge)
+	if err != nil {
+		return nil, nil, fmt.Errorf("test read: %w", err)
 	}
 	log.Info("test read OK")
-	return meters, nil
+	return meters, first, nil
 }
 
 // Measurement is one scrape of all meters.

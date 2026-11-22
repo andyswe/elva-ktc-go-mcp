@@ -25,7 +25,9 @@ keep anything specific to one installation out of this file.
    `AGENTS_OWNER.md` and `CLAUDE.local.md`. Keep local settings in a personal file such
    as `.env.<name>`. Tests use the fake password `secret`, and test fixtures must not
    contain real names, serial numbers or addresses.
-4. Use the standard library only, unless a dependency clearly pays for itself.
+4. **Use the standard library only, unless a dependency clearly pays for itself.** The
+   only dependency today is `github.com/jackc/pgx/v5`, because Go has no built-in
+   PostgreSQL driver.
 5. **Define every setting in the `settings` table in `cmd/elva/config.go`.** Don't call
    `os.Getenv` anywhere else. The table drives `-help` and the startup settings log,
    and secrets must not leak into logs. Mark a setting `secret: true` if it holds a
@@ -34,7 +36,7 @@ keep anything specific to one installation out of this file.
 
 ## Build, test, run
 
-Requires Go 1.24 or newer. If Go was installed from the tarball into a user directory
+Requires Go 1.25 or newer (pgx needs it). If Go was installed from the tarball into a user directory
 such as `~/.local/go`, put it on the PATH, e.g. in `~/.bashrc`:
 `export PATH="$HOME/.local/go/bin:$HOME/go/bin:$PATH"`. Otherwise you get
 `go: command not found`.
@@ -46,8 +48,29 @@ go build -o bin/elva ./cmd/elva
 ELVA_INTERVAL=10s ./bin/elva -env-file .env.<name>    # faster, for manual testing only
 ```
 
-To check the startup failure paths: an empty env gives exit 1, `KTC_HOST` set to an
-unused IP gives exit 2, and a wrong `KTC_PASSWORD` gives exit 3.
+To check the startup failure paths:
+- an empty env gives exit 1;
+- `KTC_HOST` set to an unused IP gives exit 2;
+- a wrong `KTC_PASSWORD` gives exit 3;
+- an unreachable `ELVA_DATABASE_URL` gives exit 5.
+
+### Database tests
+
+`internal/store` tests run against a real PostgreSQL when `ELVA_TEST_DATABASE_URL` is
+set, and are skipped otherwise. **They truncate the `measurement` table**, so use a
+throwaway database only:
+
+```sh
+docker run -d --rm --name elva-test-pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=elva \
+  -p 127.0.0.1:55432:5432 postgres:17
+ELVA_TEST_DATABASE_URL=postgres://postgres:test@127.0.0.1:55432/elva go test ./...
+docker stop elva-test-pg    # --rm deletes it
+```
+
+To test an outage end to end, run ElVa against that container with
+`ELVA_INTERVAL=10s`. Then `docker pause elva-test-pg` for a few scrapes, followed by
+`docker unpause`. The log should show "buffering" warnings, then "buffered rows
+written", and the table should have no gap.
 
 ### Configuration loading
 
@@ -75,12 +98,15 @@ unused IP gives exit 2, and a wrong `KTC_PASSWORD` gives exit 3.
 
 | Path | Contents |
 |------|----------|
-| `cmd/elva/main.go` | Startup check, minute loop, cursor restore, meter freshness check (`meterAgeProblem`), JSON output |
+| `cmd/elva/main.go` | Startup checks (database, RCU), minute loop, cursor restore, meter freshness check (`meterAgeProblem`), database write or JSON output |
+| `cmd/elva/row.go` | Maps readings to columns by quantity (`toRow`), with unit conversion; rejects two meters filling one column |
+| `cmd/elva/buffer.go` | In-memory row buffer for database outages (`ELVA_DATABASE_BUFFER`), flushed oldest first in chunks |
 | `cmd/elva/config.go` | Settings table, `-env-file` loader, value sources, secret masking, `-help` text |
 | `internal/ktc/client.go` | HTTP client: `Login`, `ReadMeter`, `Cursor`, `SetCursor`; error kinds `ErrUnreachable`, `ErrAuth` |
 | `internal/ktc/parse.go` | Start page and `mb.xml` parsing, VIF unit table |
 | `internal/ktc/testdata/` | Anonymized responses captured from an RCU1111-1100 (firmware 4.7.13) |
 | `internal/ktc/ktc_test.go` | Parser tests and a fake RCU (`newFakeRCU`) that models the session and cursor |
+| `internal/store/store.go` | PostgreSQL: `Open` (connect, create schema), `Insert` (one `unnest` statement, `ON CONFLICT DO NOTHING`), `Schema` |
 
 ## How the RCU web UI works
 
@@ -160,7 +186,8 @@ behave differently.
 
 ## Roadmap and design decisions
 
-**Database (next step).** PostgreSQL schema:
+**Database (implemented).** PostgreSQL schema, created at startup from `store.Schema`.
+Keep the two in sync:
 
 ```sql
 CREATE TABLE IF NOT EXISTS measurement (
@@ -191,6 +218,15 @@ CREATE TABLE IF NOT EXISTS measurement (
     from the totals, e.g. `max(el_energy) - min(el_energy)` per day;
   - `comm_status` and `meter_time`. Freshness is checked at scrape time and logged
     as a warning instead (`meterAgeProblem`, `ELVA_MAX_METER_AGE`).
+- **Optional:** with `ELVA_DATABASE_URL` unset, ElVa prints JSON lines instead, which
+  is useful for development and for trying it out.
+- **Outages:** rows wait in an in-memory buffer (`ELVA_DATABASE_BUFFER`, default
+  168h). When it is full, the oldest rows are dropped with an error log. A restart
+  loses the buffer. A scrape that fails writes no row: there are no NULL rows for
+  RCU outages.
+- **Schema changes:** today the schema is a single idempotent `CREATE TABLE IF NOT
+  EXISTS`. Before the first incompatible change, add a schema version table and
+  numbered migrations.
 - **Scale:** about 525 k rows per year. Plain PostgreSQL with the primary key index is
   enough; no TimescaleDB or extra indexes are needed.
 

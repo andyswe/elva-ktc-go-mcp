@@ -2,11 +2,11 @@
 
 ElVa records your apartment's **electricity and water consumption** from a
 **KTC RCU1111 "lägenhetsnod"**, the M-Bus concentrator found in many Swedish
-apartment buildings. Once a minute it reads every meter connected to the RCU:
+apartment buildings. Once a minute it reads every meter connected to the RCU and
+stores the readings in **PostgreSQL**, ready for graphing in Grafana:
 
 - **Electricity:** total energy (Wh) and **momentary power (W)**
 - **Water:** total volume (l) and current flow (l/h)
-- consumption for the current and previous hour, day and month, as calculated by the RCU
 
 The RCU has no API, so ElVa logs in to its built-in web interface exactly as a browser
 would and reads the same data the web pages show. It only reads: it never changes any
@@ -17,15 +17,17 @@ browsing the web UI.
 This is version 2, a small Go rewrite of [elva-ktc](https://github.com/andyswe/elva-ktc)
 (Java/Kotlin, with its own web frontend).
 
-> **Status:** measurements are printed to stdout as JSON lines. Storing them in
-> PostgreSQL and graphing with Grafana is the next step.
+> **Status:** reading and storing in PostgreSQL work. Grafana dashboards and
+> deployment are next.
 
 ## Requirements
 
 - A KTC RCU1111 reachable over HTTP from the machine running ElVa (tested with model
   RCU1111-1100, firmware 4.7.13)
 - The RCU's web UI login password (the one on its start page, not the System password)
-- Go 1.24 or newer to build
+- PostgreSQL (tested with 17). Without a database, ElVa prints JSON lines instead,
+  which is useful for trying it out.
+- Go 1.25 or newer to build
 
 ## Quick start
 
@@ -35,8 +37,18 @@ cd elva-ktc-2
 go build -o bin/elva ./cmd/elva
 
 cp .env.sample .env.mine        # .env.* files are git-ignored
-$EDITOR .env.mine               # set KTC_HOST and KTC_PASSWORD
+$EDITOR .env.mine               # set KTC_HOST, KTC_PASSWORD and ELVA_DATABASE_URL
 ./bin/elva -env-file .env.mine
+```
+
+ElVa creates its table on first start. The database user only needs permission to
+create a table in that database, or the table must already exist. For a quick test
+database:
+
+```sh
+docker run -d --name elva-pg -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=elva \
+  -p 127.0.0.1:5432:5432 postgres:17
+# ELVA_DATABASE_URL=postgres://postgres:secret@127.0.0.1:5432/elva
 ```
 
 ElVa produces a single static binary with no dependencies. To run it on another
@@ -57,30 +69,40 @@ other secrets are masked, including passwords inside connection URLs.
 | `KTC_PASSWORD` | *(required)* | RCU web UI password |
 | `KTC_METERS` | all meters | Comma-separated meter names to read, e.g. `EL-01,VV-01` |
 | `ELVA_INTERVAL` | `1m` | Scrape interval, aligned to the wall clock (whole minutes) |
-| `ELVA_TIMEOUT` | `10s` | Timeout per HTTP request to the RCU |
+| `ELVA_TIMEOUT` | `10s` | Timeout per request to the RCU and per database operation |
 | `KTC_TIMEZONE` | `Europe/Stockholm` | Time zone of the RCU's clock; its timestamps carry none |
 | `ELVA_MAX_METER_AGE` | `2m` | Warn when the RCU's last read of a meter is older than this |
+| `ELVA_DATABASE_URL` | *(unset)* | PostgreSQL URL, e.g. `postgres://elva:pw@localhost:5432/elva`. Unset: print JSON to stdout |
+| `ELVA_DATABASE_BUFFER` | `168h` | How long to keep readings in memory while the database is unreachable |
 
 The RCU itself reads the meters once a minute, so an interval shorter than `1m` only
 repeats the same values.
 
 ## What it does
 
-1. **Startup check.** ElVa logs in, lists the meters on the RCU start page and does
-   one test read. If anything is wrong, it exits with a clear message:
+1. **Startup check.** ElVa connects to the database and creates its table if needed.
+   It then logs in to the RCU, lists the meters on the start page, does one test read
+   and logs which meter fills which column. If anything is wrong, it exits with a
+   clear message:
 
    | Exit code | Meaning |
    |-----------|---------|
    | 1 | Bad or missing configuration |
    | 2 | The RCU can't be reached (wrong host, network down) |
    | 3 | The RCU rejected the password |
-   | 4 | Anything else, e.g. a name in `KTC_METERS` doesn't exist |
+   | 4 | Anything else, e.g. a name in `KTC_METERS` doesn't exist, or two meters measure the same thing |
+   | 5 | The database can't be reached, or the table can't be created |
 
-2. **Every minute**, ElVa reads all meters and prints one JSON line to stdout. Logs go
-   to stderr; ElVa has no log file of its own. Under systemd they end up in the journal
-   (`journalctl -u elva`), and in a container they go to `docker logs`. A failed scrape
-   is logged and retried on the next minute, so a rebooting RCU or a network glitch
-   doesn't stop the service.
+2. **Every minute**, ElVa reads all meters and writes one row to the database, or
+   prints one JSON line to stdout when no database is configured.
+   - **Database down:** rows are kept in memory and written once it is back, for up
+     to `ELVA_DATABASE_BUFFER` (one week by default). A restart of ElVa during an
+     outage loses the buffered rows. Even then, consumption over the gap can still
+     be computed from the totals.
+   - **Logs** go to stderr; ElVa has no log file of its own. Under systemd they end up in the journal
+   (`journalctl -u elva`), and in a container they go to `docker logs`.
+   - **A failed scrape** is logged and retried on the next minute, so a rebooting
+     RCU or a network glitch doesn't stop the service.
 
 3. **Each reading is checked for freshness.** The RCU reads every meter about once a
    minute, so its last read is normally 0-60 s old. If it is older than
@@ -88,10 +110,54 @@ repeats the same values.
    reading. Totals stay correct anyway; only the momentary power or flow may be
    outdated. A warning on every scrape usually means `KTC_TIMEZONE` is wrong.
 
-### Output format
+### Database
 
-Each line is one compact JSON object. Here is one scrape, pretty-printed with
-explanations (real output has no comments). It was taken at 13:28 on 22 November.
+ElVa writes one row per scrape to the table `measurement`:
+
+```sql
+CREATE TABLE measurement (
+    time       timestamptz PRIMARY KEY,  -- scrape time, whole minutes
+    el_energy  bigint,                   -- electricity meter total, Wh
+    el_power   integer,                  -- electricity momentary power, W
+    va_volume  bigint,                   -- water meter total, l
+    va_flow    real                      -- water momentary flow, l/h
+);
+```
+
+- **Which meter fills which column** depends on what it measures: the meter reporting
+  energy and power fills `el_*`, the one reporting volume and flow fills `va_*`.
+  Units are converted, so a meter configured in kWh or m3 still ends up in Wh and l.
+- **Missing values are NULL**, e.g. when one meter has no reading.
+- **`time` is an exact moment (`timestamptz`)**, so summer time changes cause no gaps
+  or duplicates, and Grafana shows local time correctly.
+- **The RCU's per-period values** (`current_day` and so on) are not stored. Compute any
+  period from the totals instead:
+
+```sql
+-- electricity (kWh) and water (l) per day, in Swedish time
+SELECT date_trunc('day', time AT TIME ZONE 'Europe/Stockholm') AS day,
+       (max(el_energy) - min(el_energy)) / 1000.0 AS kwh,
+       max(va_volume) - min(va_volume)             AS litres
+FROM measurement GROUP BY 1 ORDER BY 1;
+
+-- power curve for Grafana (time series panel)
+SELECT time, el_power FROM measurement WHERE $__timeFilter(time) ORDER BY time;
+```
+
+### JSON output (without a database)
+
+When `ELVA_DATABASE_URL` is unset, ElVa prints each scrape as one compact JSON line on
+stdout. This output contains everything the RCU reports, including the per-period
+values. Readings are the only thing on stdout; all logs go to stderr, so the two can be
+sent to different places:
+
+```sh
+./bin/elva -env-file .env.mine > readings.jsonl 2> elva.log
+./bin/elva -env-file .env.mine 2>/dev/null | jq '.meters[] | {name, values}'
+```
+
+Here is one scrape, pretty-printed with explanations (real output has no comments).
+It was taken at 13:28 on 22 November.
 
 ```jsonc
 {
@@ -199,7 +265,7 @@ Possible `quantity`/`unit` pairs, depending on how a meter is set up on the RCU:
 ## Roadmap
 
 - [x] Read electricity and water from the RCU; startup connectivity and auth check
-- [ ] Store in PostgreSQL
+- [x] Store in PostgreSQL
 - [ ] Grafana dashboards
 - [ ] Container or systemd deployment
 
