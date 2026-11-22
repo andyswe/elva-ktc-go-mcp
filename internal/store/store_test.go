@@ -41,9 +41,15 @@ func TestInsert(t *testing.T) {
 		{Time: t0.Add(time.Hour)},                               // 02:30 CET, same wall clock time: must be a separate row
 		{Time: t0.Add(2 * time.Hour), ElPower: ptr(int32(400))}, // water meter missing
 	}
+	if last, err := s.Latest(ctx); err != nil || !last.IsZero() {
+		t.Fatalf("Latest on empty table = %v, %v; want zero", last, err)
+	}
 	n, err := s.Insert(ctx, rows)
 	if err != nil || n != 3 {
 		t.Fatalf("Insert = %d, %v; want 3", n, err)
+	}
+	if last, err := s.Latest(ctx); err != nil || !last.Equal(t0.Add(2*time.Hour)) {
+		t.Fatalf("Latest = %v, %v; want %v", last, err, t0.Add(2*time.Hour))
 	}
 	// Re-inserting (a retry after an error) must skip existing rows, not fail.
 	n, err = s.Insert(ctx, rows[:2])

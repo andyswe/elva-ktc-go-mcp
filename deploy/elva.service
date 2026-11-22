@@ -1,0 +1,47 @@
+# systemd unit for ElVa. deploy/install.sh replaces @PREFIX@ and installs it as
+# /etc/systemd/system/elva.service. Edit this template, not the installed copy.
+[Unit]
+Description=ElVa - electricity and water meter reader (KTC RCU)
+Documentation=https://github.com/andyswe/elva-ktc-2
+Wants=network-online.target
+# Ordering only: harmless when PostgreSQL runs on another machine.
+After=network-online.target postgresql.service
+# Keep retrying while the network or database is down, e.g. at boot.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=elva
+Group=elva
+EnvironmentFile=@PREFIX@/elva.env
+ExecStart=@PREFIX@/bin/elva
+# Exit codes: 1 config, 2 RCU unreachable, 3 wrong password, 4 other startup error,
+# 5 database unreachable. Retrying can't fix 1, 3 and 4, so those stop the service.
+Restart=on-failure
+RestartSec=30s
+RestartPreventExitStatus=1 3 4
+
+# Hardening: ElVa only needs outgoing network connections. It writes no files.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

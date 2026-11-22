@@ -62,6 +62,18 @@ func Open(ctx context.Context, url string) (*Store, error) {
 // Close closes all connections.
 func (s *Store) Close() { s.pool.Close() }
 
+// Latest returns the time of the newest row, or the zero time if the table is empty.
+func (s *Store) Latest(ctx context.Context) (time.Time, error) {
+	var t *time.Time
+	if err := s.pool.QueryRow(ctx, "SELECT max(time) FROM measurement").Scan(&t); err != nil {
+		return time.Time{}, err
+	}
+	if t == nil {
+		return time.Time{}, nil
+	}
+	return *t, nil
+}
+
 // Insert writes rows in one statement. Rows whose time already exists are skipped,
 // so retrying after an error or a restart can't create duplicates. It returns the
 // number of rows actually inserted.

@@ -106,7 +106,12 @@ written", and the table should have no gap.
 | `internal/ktc/parse.go` | Start page and `mb.xml` parsing, VIF unit table |
 | `internal/ktc/testdata/` | Anonymized responses captured from an RCU1111-1100 (firmware 4.7.13) |
 | `internal/ktc/ktc_test.go` | Parser tests and a fake RCU (`newFakeRCU`) that models the session and cursor |
-| `internal/store/store.go` | PostgreSQL: `Open` (connect, create schema), `Insert` (one `unnest` statement, `ON CONFLICT DO NOTHING`), `Schema` |
+| `internal/store/store.go` | PostgreSQL: `Open` (connect, create schema), `Insert` (one `unnest` statement, `ON CONFLICT DO NOTHING`), `Latest`, `Schema` |
+| `scripts/build.sh` | Builds `bin/elva` with `-X main.version=$(git describe --tags --always --dirty)` |
+| `deploy/elva.service` | systemd unit template (`@PREFIX@` is replaced by `install.sh`) |
+| `deploy/install.sh` | Install or upgrade: user `elva`, `PREFIX/bin/elva`, `PREFIX/elva.env` (never overwritten), unit; enable and restart |
+| `deploy/verify.sh` | Checks files, permissions, settings, unit drift, service state, then `elva -check`, last-row age and journal warnings |
+| `deploy/uninstall.sh` | Removes the service and binary; `--purge` also removes `PREFIX` and the user. Never touches the database |
 
 ## How the RCU web UI works
 
@@ -232,5 +237,43 @@ CREATE TABLE IF NOT EXISTS measurement (
 
 **Grafana** reads directly from PostgreSQL.
 
-**Deployment:** not decided yet. Options are a systemd unit running the static binary,
-or docker compose alongside PostgreSQL and Grafana.
+**Deployment (implemented): a systemd service installed from a checkout.**
+- **Layout:** `/opt/elva` by default, with `PREFIX` to override.
+- **No binaries in git:** the target builds with `scripts/build.sh`. Go 1.21 and later
+  fetch the toolchain `go.mod` asks for if the installed Go is older.
+- **The unit's restart policy follows the exit codes:**
+  - 2 and 5 (RCU or database unreachable) restart every 30 s with no start limit;
+  - 1, 3 and 4 (config, password, meters) stop the service (`RestartPreventExitStatus`).
+
+  Keep the exit codes in `main.go`, the unit and the README in sync.
+- **Hardening:** the unit uses systemd sandboxing (ProtectSystem=strict, no
+  capabilities, address families limited to IP and Unix sockets, ...).
+  `systemd-analyze security elva` scores 3.0. ElVa needs only outgoing network
+  connections and writes no files; keep it that way, or relax the unit deliberately.
+- **`ProtectHome=yes`** means `PREFIX` must not be under `/home`; `install.sh` refuses.
+- **`-check`** runs config, database and RCU startup checks and exits; `verify.sh`
+  uses it.
+- **`-version`** prints the build version, which is also the first line of every
+  startup log.
+
+**Testing the deploy scripts** without a real machine, in a throwaway systemd container:
+
+```sh
+# image: debian:trixie + systemd systemd-sysv procps diffutils, CMD /sbin/init
+docker network create elva-test && docker network connect elva-test elva-test-pg
+docker run -d --name elva-sd --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
+  --network elva-test elva-systemd-test
+# copy committed files only (never private ones), plus the binary built by scripts/build.sh
+git archive HEAD | docker exec -i elva-sd sh -c 'mkdir -p /srv/elva && tar -xf - -C /srv/elva'
+docker cp bin/elva elva-sd:/srv/elva/bin/elva
+docker exec -it elva-sd bash    # then: cd /srv/elva && deploy/install.sh && deploy/verify.sh ...
+```
+
+Use `ELVA_DATABASE_URL=postgres://postgres:test@elva-test-pg:5432/elva` inside the
+container. Scenarios worth repeating after changing the scripts or the unit:
+- first install, then verify with the sample config (expect failures);
+- a real config: start, wait a minute, then verify (expect all good);
+- an upgrade keeps `elva.env` byte for byte;
+- a wrong password gives `failed` with 0 restarts;
+- the database paused at startup gives restarts, then recovers by itself;
+- uninstall, then `--purge`.

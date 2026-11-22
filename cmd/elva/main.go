@@ -27,6 +27,9 @@ import (
 	"github.com/andyswe/elva-ktc-2/internal/store"
 )
 
+// version is set at build time by scripts/build.sh (-ldflags "-X main.version=...").
+var version = "dev"
+
 // Exit codes, so a supervisor can tell why startup failed.
 const (
 	exitConfig      = 1
@@ -38,14 +41,21 @@ const (
 
 func main() {
 	envFile := flag.String("env-file", "", "load settings from this KEY=VALUE file (see .env.sample)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
+	check := flag.Bool("check", false, "run the startup checks (config, database, RCU test read), then exit")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-env-file FILE]\n\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-env-file FILE] [-check] [-version]\n\n", os.Args[0])
 		flag.PrintDefaults()
 		printSettingsHelp(flag.CommandLine.Output())
 	}
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	log.Info("ElVa starting", "version", version, "check_only", *check)
 
 	var fromFile map[string]bool
 	if *envFile != "" {
@@ -82,6 +92,18 @@ func main() {
 		}
 		defer db.Close()
 		log.Info("connected to database, table measurement ready")
+		lctx, cancel := context.WithTimeout(ctx, cfg.timeout)
+		last, err := db.Latest(lctx)
+		cancel()
+		switch {
+		case err != nil:
+			log.Warn("cannot read latest stored row", "err", err)
+		case last.IsZero():
+			log.Info("database has no rows yet")
+		default:
+			age := time.Since(last)
+			log.Info("last stored row", "time", last, "age", age.Round(time.Second), "age_seconds", int(age.Seconds()))
+		}
 	} else {
 		log.Info("ELVA_DATABASE_URL not set: printing measurements as JSON to stdout")
 	}
@@ -107,6 +129,10 @@ func main() {
 			os.Exit(exitOther)
 		}
 		log.Info("storing", "columns", storedColumns(first))
+	}
+	if *check {
+		log.Info("check passed")
+		return
 	}
 
 	out := json.NewEncoder(os.Stdout)

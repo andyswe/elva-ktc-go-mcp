@@ -55,6 +55,52 @@ ElVa produces a single static binary with no dependencies. To run it on another
 machine, build it there or cross-compile it, for example
 `GOOS=linux GOARCH=arm64 go build -o bin/elva ./cmd/elva` for a Raspberry Pi.
 
+## Install as a service
+
+On a Linux machine with systemd, ElVa runs as a service built from a checkout of this
+repository. The build runs as your normal user; installing needs `sudo`.
+
+```sh
+git clone https://github.com/andyswe/elva-ktc-2.git && cd elva-ktc-2
+scripts/build.sh                 # builds bin/elva with its version built in
+sudo deploy/install.sh           # installs to /opt/elva and enables elva.service
+sudo nano /opt/elva/elva.env     # first install only: fill in the settings
+sudo systemctl start elva
+sudo deploy/verify.sh            # checks installation, settings, service, RCU and database
+```
+
+| Path | |
+|------|---|
+| `/opt/elva/bin/elva` | The binary, owned by root |
+| `/opt/elva/elva.env` | Settings, readable only by root and the service (`0640 root:elva`) |
+| `/etc/systemd/system/elva.service` | The systemd unit, generated from `deploy/elva.service` |
+
+The service runs as the unprivileged system user `elva`, with systemd's sandboxing
+options enabled. Use `PREFIX=/some/dir` with the deploy scripts to install somewhere
+other than `/opt/elva`.
+
+- **Logs:** `journalctl -u elva -f`
+- **Upgrade:** `git pull && scripts/build.sh && sudo deploy/install.sh`. This replaces
+  the binary, keeps `elva.env` and restarts the service.
+- **Check:** `sudo deploy/verify.sh` checks the files and their permissions, the
+  settings, whether the service is enabled and running, and the version against your
+  build. It then runs `elva -check`: a full startup check against the RCU and the
+  database, as the service user with the installed settings. Finally it shows when the
+  last row was stored and any warnings in the journal from the past hour. It exits
+  with 1 if anything failed.
+- **Uninstall:** `sudo deploy/uninstall.sh` removes the service and the binary but
+  keeps `elva.env`. Add `--purge` to also remove `/opt/elva` and the `elva` user. The
+  database is never touched.
+- **Restarts** depend on why ElVa stopped:
+  - A missing network or database (exit codes 2 and 5) is retried every 30 s, e.g.
+    at boot before they are up.
+  - Mistakes that retrying can't fix (bad settings, wrong password, meter problems:
+    exit codes 1, 3 and 4) stop the service, which shows as `failed` in
+    `systemctl status elva`.
+
+`elva -version` prints the version, and `elva -check` runs the startup checks and
+exits without scraping. The version is also the first line of every startup log.
+
 ## Configuration
 
 Set these as environment variables or put them in a file passed with `-env-file`.
@@ -267,7 +313,7 @@ Possible `quantity`/`unit` pairs, depending on how a meter is set up on the RCU:
 - [x] Read electricity and water from the RCU; startup connectivity and auth check
 - [x] Store in PostgreSQL
 - [ ] Grafana dashboards
-- [ ] Container or systemd deployment
+- [x] systemd service with install, verify and uninstall scripts
 
 ## License
 
