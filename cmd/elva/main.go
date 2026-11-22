@@ -23,8 +23,9 @@ import (
 	"time"
 	_ "time/tzdata" // KTC_TIMEZONE must resolve even where the OS has no zone database
 
-	"github.com/andyswe/elva-ktc-2/internal/ktc"
-	"github.com/andyswe/elva-ktc-2/internal/store"
+	"github.com/andyswe/elva-ktc-go-mcp/internal/config"
+	"github.com/andyswe/elva-ktc-go-mcp/internal/ktc"
+	"github.com/andyswe/elva-ktc-go-mcp/internal/store"
 )
 
 // version is set at build time by scripts/build.sh (-ldflags "-X main.version=...").
@@ -46,7 +47,7 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-env-file FILE] [-check] [-version]\n\n", os.Args[0])
 		flag.PrintDefaults()
-		printSettingsHelp(flag.CommandLine.Output())
+		config.PrintHelp(flag.CommandLine.Output(), settings)
 	}
 	flag.Parse()
 	if *showVersion {
@@ -57,18 +58,12 @@ func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	log.Info("ElVa starting", "version", version, "check_only", *check)
 
-	var fromFile map[string]bool
-	if *envFile != "" {
-		var err error
-		if fromFile, err = loadEnvFile(*envFile); err != nil {
-			log.Error("cannot load env file", "err", err)
-			os.Exit(exitConfig)
-		}
-		log.Info("loaded env file", "path", *envFile)
+	vs, err := config.Load(log, settings, *envFile)
+	if err != nil {
+		log.Error("cannot load env file", "err", err)
+		os.Exit(exitConfig)
 	}
-	rs := resolveSettings(fromFile)
-	logSettings(log, rs)
-	cfg, err := parseConfig(rs)
+	cfg, err := parseConfig(vs)
 	if err != nil {
 		log.Error("invalid configuration", "err", err)
 		os.Exit(exitConfig)
@@ -193,7 +188,7 @@ func main() {
 // startupCheck logs in, discovers meters and does one full read, so that
 // configuration problems surface immediately rather than a minute later.
 // It returns the meters to read and the test measurement.
-func startupCheck(ctx context.Context, log *slog.Logger, c *ktc.Client, cfg config) ([]ktc.MeterRef, *Measurement, error) {
+func startupCheck(ctx context.Context, log *slog.Logger, c *ktc.Client, cfg options) ([]ktc.MeterRef, *Measurement, error) {
 	page, err := c.Login(ctx)
 	if err != nil {
 		return nil, nil, err

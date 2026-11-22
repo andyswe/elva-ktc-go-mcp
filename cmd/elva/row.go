@@ -5,7 +5,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/andyswe/elva-ktc-2/internal/store"
+	"github.com/andyswe/elva-ktc-go-mcp/internal/store"
 )
 
 // column maps a meter quantity to its database column and the factors that convert

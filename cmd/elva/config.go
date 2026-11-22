@@ -1,40 +1,27 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
-	"io"
-	"log/slog"
-	"net/url"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/andyswe/elva-ktc-go-mcp/internal/config"
 )
 
-// setting describes one configuration variable. Every setting must be listed here:
-// the table drives loading, the startup log and -help, so a new setting is
-// documented and logged automatically.
-type setting struct {
-	name     string
-	def      string // default value; empty means none
-	required bool
-	secret   bool // never logged; names containing PASSWORD/SECRET/TOKEN are treated as secret too
-	help     string
+// settings is the single place elva's settings are defined: the table drives
+// loading, the startup log and -help.
+var settings = []config.Setting{
+	{Name: "KTC_HOST", Required: true, Help: "host or host:port of the KTC RCU, e.g. 192.168.1.100"},
+	{Name: "KTC_PASSWORD", Required: true, Secret: true, Help: "RCU web UI login password"},
+	{Name: "KTC_METERS", Help: "comma-separated meter names to read, e.g. EL-01,VV-01 (default: all meters on the RCU)"},
+	{Name: "KTC_TIMEZONE", Default: "Europe/Stockholm", Help: "time zone of the RCU clock (its timestamps carry none)"},
+	{Name: "ELVA_INTERVAL", Default: "1m", Help: "scrape interval, aligned to the wall clock"},
+	{Name: "ELVA_TIMEOUT", Default: "10s", Help: "timeout per request to the RCU and per database operation"},
+	{Name: "ELVA_MAX_METER_AGE", Default: "2m", Help: "warn when the RCU's last read of a meter is older than this (the reading is still used)"},
+	{Name: "ELVA_DATABASE_URL", Help: "PostgreSQL URL, e.g. postgres://elva:pw@localhost:5432/elva (unset: print JSON to stdout instead)"},
+	{Name: "ELVA_DATABASE_BUFFER", Default: "168h", Help: "how long to keep rows in memory while the database is unreachable"},
 }
 
-var settings = []setting{
-	{name: "KTC_HOST", required: true, help: "host or host:port of the KTC RCU, e.g. 192.168.1.100"},
-	{name: "KTC_PASSWORD", required: true, secret: true, help: "RCU web UI login password"},
-	{name: "KTC_METERS", help: "comma-separated meter names to read, e.g. EL-01,VV-01 (default: all meters on the RCU)"},
-	{name: "KTC_TIMEZONE", def: "Europe/Stockholm", help: "time zone of the RCU clock (its timestamps carry none)"},
-	{name: "ELVA_INTERVAL", def: "1m", help: "scrape interval, aligned to the wall clock"},
-	{name: "ELVA_TIMEOUT", def: "10s", help: "timeout per request to the RCU and per database operation"},
-	{name: "ELVA_MAX_METER_AGE", def: "2m", help: "warn when the RCU's last read of a meter is older than this (the reading is still used)"},
-	{name: "ELVA_DATABASE_URL", help: "PostgreSQL URL, e.g. postgres://elva:pw@localhost:5432/elva (unset: print JSON to stdout instead)"},
-	{name: "ELVA_DATABASE_BUFFER", def: "168h", help: "how long to keep rows in memory while the database is unreachable"},
-}
-
-type config struct {
+type options struct {
 	host        string
 	password    string
 	meters      []string
@@ -46,140 +33,27 @@ type config struct {
 	dbBuffer    time.Duration
 }
 
-// resolved is a setting's effective value and where it came from.
-type resolved struct {
-	setting
-	value  string
-	source string // "environment", "env file", "default" or "none"
-}
-
-// resolveSettings looks up every setting. fromFile holds the names set by -env-file.
-func resolveSettings(fromFile map[string]bool) []resolved {
-	out := make([]resolved, len(settings))
-	for i, s := range settings {
-		r := resolved{setting: s, source: "none"}
-		if v, ok := os.LookupEnv(s.name); ok && v != "" {
-			r.value, r.source = v, "environment"
-			if fromFile[s.name] {
-				r.source = "env file"
-			}
-		} else if s.def != "" {
-			r.value, r.source = s.def, "default"
-		}
-		out[i] = r
+// parseConfig validates resolved settings.
+func parseConfig(vs config.Values) (c options, err error) {
+	if err := vs.CheckRequired(); err != nil {
+		return c, err
 	}
-	return out
-}
-
-// logSettings logs every setting with secrets masked.
-func logSettings(log *slog.Logger, rs []resolved) {
-	for _, r := range rs {
-		log.Info("setting", "name", r.name, "value", r.display(), "source", r.source)
-	}
-}
-
-func (r resolved) display() string {
-	switch {
-	case r.value == "":
-		return "(not set)"
-	case r.secret || looksSecret(r.name):
-		return "*****"
-	}
-	// Connection strings like postgres://user:pw@host/db carry a password.
-	if u, err := url.Parse(r.value); err == nil && u.User != nil {
-		if _, ok := u.User.Password(); ok {
-			return u.Redacted()
-		}
-	}
-	return r.value
-}
-
-func looksSecret(name string) bool {
-	for _, w := range []string{"PASSWORD", "SECRET", "TOKEN"} {
-		if strings.Contains(name, w) {
-			return true
-		}
-	}
-	return false
-}
-
-// parseConfig validates resolved settings into a config.
-func parseConfig(rs []resolved) (config, error) {
-	v := map[string]string{}
-	var missing []string
-	for _, r := range rs {
-		v[r.name] = r.value
-		if r.required && r.value == "" {
-			missing = append(missing, r.name)
-		}
-	}
-	var cfg config
-	if len(missing) > 0 {
-		return cfg, fmt.Errorf("missing required setting(s): %s", strings.Join(missing, ", "))
-	}
-	cfg.host, cfg.password, cfg.dbURL = v["KTC_HOST"], v["KTC_PASSWORD"], v["ELVA_DATABASE_URL"]
-	for _, n := range strings.Split(v["KTC_METERS"], ",") {
+	c.host, c.password, c.dbURL = vs.Get("KTC_HOST"), vs.Get("KTC_PASSWORD"), vs.Get("ELVA_DATABASE_URL")
+	for _, n := range strings.Split(vs.Get("KTC_METERS"), ",") {
 		if n = strings.TrimSpace(n); n != "" {
-			cfg.meters = append(cfg.meters, n)
+			c.meters = append(c.meters, n)
 		}
 	}
-	for _, d := range []struct {
-		name string
-		dst  *time.Duration
-	}{{"ELVA_INTERVAL", &cfg.interval}, {"ELVA_TIMEOUT", &cfg.timeout}, {"ELVA_MAX_METER_AGE", &cfg.maxMeterAge}, {"ELVA_DATABASE_BUFFER", &cfg.dbBuffer}} {
-		dur, err := time.ParseDuration(v[d.name])
-		if err != nil || dur <= 0 {
-			return cfg, fmt.Errorf("%s=%q: must be a positive duration like 1m or 30s", d.name, v[d.name])
-		}
-		*d.dst = dur
-	}
-	loc, err := time.LoadLocation(v["KTC_TIMEZONE"])
-	if err != nil {
-		return cfg, fmt.Errorf("KTC_TIMEZONE=%q: %v", v["KTC_TIMEZONE"], err)
-	}
-	cfg.loc = loc
-	return cfg, nil
-}
-
-// loadEnvFile sets KEY=VALUE lines from path, skipping blanks and # comments, and
-// returns the names it set. Variables already present in the environment win.
-func loadEnvFile(path string) (map[string]bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	set := map[string]bool{}
-	sc := bufio.NewScanner(f)
-	for n := 1; sc.Scan(); n++ {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		k, v, ok := strings.Cut(strings.TrimPrefix(line, "export "), "=")
-		if !ok {
-			return nil, fmt.Errorf("%s:%d: expected KEY=VALUE", path, n)
-		}
-		k, v = strings.TrimSpace(k), strings.Trim(strings.TrimSpace(v), `"'`)
-		if _, exists := os.LookupEnv(k); !exists {
-			os.Setenv(k, v)
-			set[k] = true
+	for name, dst := range map[string]*time.Duration{
+		"ELVA_INTERVAL": &c.interval, "ELVA_TIMEOUT": &c.timeout,
+		"ELVA_MAX_METER_AGE": &c.maxMeterAge, "ELVA_DATABASE_BUFFER": &c.dbBuffer,
+	} {
+		if *dst, err = vs.Duration(name); err != nil {
+			return c, err
 		}
 	}
-	return set, sc.Err()
-}
-
-// printSettingsHelp writes the settings table for -help.
-func printSettingsHelp(w io.Writer) {
-	fmt.Fprintln(w, "\nSettings (environment variables; also accepted in the -env-file file):")
-	for _, s := range settings {
-		extra := ""
-		switch {
-		case s.required:
-			extra = " (required)"
-		case s.def != "":
-			extra = " (default " + s.def + ")"
-		}
-		fmt.Fprintf(w, "  %-21s %s%s\n", s.name, s.help, extra)
+	if c.loc, err = vs.Location("KTC_TIMEZONE"); err != nil {
+		return c, err
 	}
+	return c, nil
 }

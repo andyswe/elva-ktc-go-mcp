@@ -2,7 +2,7 @@
 # /etc/systemd/system/elva.service. Edit this template, not the installed copy.
 [Unit]
 Description=ElVa - electricity and water meter reader (KTC RCU)
-Documentation=https://github.com/andyswe/elva-ktc-2
+Documentation=https://github.com/andyswe/elva-ktc-go-mcp
 Wants=network-online.target
 # Ordering only: harmless when PostgreSQL runs on another machine.
 After=network-online.target postgresql.service

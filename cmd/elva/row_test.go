@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andyswe/elva-ktc-2/internal/ktc"
-	"github.com/andyswe/elva-ktc-2/internal/store"
+	"github.com/andyswe/elva-ktc-go-mcp/internal/ktc"
+	"github.com/andyswe/elva-ktc-go-mcp/internal/store"
 )
 
 func meter(name string, vals ...ktc.Value) *ktc.MeterReading {

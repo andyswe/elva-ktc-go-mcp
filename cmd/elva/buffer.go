@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 
-	"github.com/andyswe/elva-ktc-2/internal/store"
+	"github.com/andyswe/elva-ktc-go-mcp/internal/store"
 )
 
 // buffer holds rows not yet written to the database, so a database outage loses

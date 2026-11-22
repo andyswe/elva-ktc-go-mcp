@@ -14,11 +14,17 @@ setting on the RCU. It also puts the web UI back on the page it found, so it is 
 run alongside other users of the device, such as your electricity company or someone
 browsing the web UI.
 
+It also comes with **`elva-mcp-stdio`**, an [MCP](https://modelcontextprotocol.io) server
+that lets an AI assistant such as Claude answer questions about your consumption:
+"how much electricity did we use last winter compared with the one before?", "what is
+our standby load at night?", "is there water running at night?". See
+[MCP server](#mcp-server-ask-an-ai-assistant-about-your-data).
+
 This is version 2, a small Go rewrite of [elva-ktc](https://github.com/andyswe/elva-ktc)
 (Java/Kotlin, with its own web frontend).
 
-> **Status:** reading and storing in PostgreSQL work. Grafana dashboards and
-> deployment are next.
+> **Status:** reading, storing in PostgreSQL, the systemd service and the MCP server
+> work. Grafana dashboards are next.
 
 ## Requirements
 
@@ -32,8 +38,8 @@ This is version 2, a small Go rewrite of [elva-ktc](https://github.com/andyswe/e
 ## Quick start
 
 ```sh
-git clone https://github.com/andyswe/elva-ktc-2.git
-cd elva-ktc-2
+git clone https://github.com/andyswe/elva-ktc-go-mcp.git
+cd elva-ktc-go-mcp
 go build -o bin/elva ./cmd/elva
 
 cp .env.sample .env.mine        # .env.* files are git-ignored
@@ -61,9 +67,9 @@ On a Linux machine with systemd, ElVa runs as a service built from a checkout of
 repository. The build runs as your normal user; installing needs `sudo`.
 
 ```sh
-git clone https://github.com/andyswe/elva-ktc-2.git && cd elva-ktc-2
-scripts/build.sh                 # builds bin/elva with its version built in
-sudo deploy/install.sh           # installs to /opt/elva and enables elva.service
+git clone https://github.com/andyswe/elva-ktc-go-mcp.git && cd elva-ktc-go-mcp
+scripts/build.sh                 # builds bin/elva and bin/elva-mcp-stdio with their version
+sudo deploy/install.sh           # installs to /opt/elva and enables elva.service (+ MCP server)
 sudo nano /opt/elva/elva.env     # first install only: fill in the settings
 sudo systemctl start elva
 sudo deploy/verify.sh            # checks installation, settings, service, RCU and database
@@ -308,12 +314,77 @@ Possible `quantity`/`unit` pairs, depending on how a meter is set up on the RCU:
 | `pressure` | bar |
 | `vif_<code>` | *(empty)*, for an RCU unit code ElVa doesn't know yet |
 
+## MCP server: ask an AI assistant about your data
+
+`elva-mcp-stdio` is a separate, **read-only** program that gives an MCP client
+(Claude Code, Claude Desktop and others) tools to analyse the stored data. The client
+starts it on demand and talks to it over stdin/stdout. It starts in milliseconds, so
+running it over SSH on the database machine works well. The database then never has
+to be exposed to the network, and your SSH key is the authentication.
+
+| Tool | What it answers |
+|------|-----------------|
+| `get_latest` | Power right now, water flow, meter totals, and how old the reading is |
+| `get_consumption` | kWh and litres per hour, day, week, month or year (from the meter totals, so correct across gaps and DST), with average and peak power |
+| `get_timeseries` | Power or water flow over time, downsampled to at most 500 steps (min/avg/max) |
+| `get_baseload` | Standby power and water use per night (default 01:00-05:00), typical baseload, kWh per year and trend. Grouped per week or month for long ranges |
+| `get_data_info` | Rows, first and last reading, and gaps |
+| `query` | Any single read-only SQL statement (row limit, statement timeout) |
+
+It also offers the resource `elva://schema`, describing the table and its units. Times
+in and out are local (`ELVA_TIMEZONE`, default `Europe/Stockholm`). Inputs accept
+`2026-11-22`, `2026-11`, `2026-11-22T14:00` or relative values like `-7d` and `-3mo`.
+
+**Setup** (on the machine with the database, after installing the service):
+
+1. **Create a read-only database role.** It may only `SELECT` from `measurement`:
+   ```sh
+   sudo -u postgres psql -d elva -v pw="'a-strong-password'" -f deploy/readonly-role.sql
+   ```
+2. **Configure the MCP server.** `deploy/install.sh` installs `elva-mcp-stdio` and
+   creates `/opt/elva/mcp.env`, readable only by root and the group `elva-mcp`. Set
+   `ELVA_DATABASE_URL` there to the read-only role:
+   `postgres://elva_ro:a-strong-password@localhost:5432/elva`.
+3. **Allow your user to run it**, then check:
+   ```sh
+   sudo usermod -aG elva-mcp $USER
+   sudo deploy/verify.sh
+   ```
+4. **Add it to your MCP client** on your own computer. With Claude Code:
+   ```sh
+   claude mcp add elva -- ssh -o BatchMode=yes you@server /opt/elva/bin/elva-mcp-stdio -env-file /opt/elva/mcp.env
+   ```
+   Or in Claude Desktop's `claude_desktop_config.json`:
+   ```json
+   { "mcpServers": { "elva": {
+       "command": "ssh",
+       "args": ["-o", "BatchMode=yes", "you@server", "/opt/elva/bin/elva-mcp-stdio", "-env-file", "/opt/elva/mcp.env"]
+   } } }
+   ```
+   SSH must log in with a key and without prompts. Test it with
+   `ssh you@server /opt/elva/bin/elva-mcp-stdio -version`.
+
+**Safety:** the server can only read. Its database sessions are read-only, the role
+has `SELECT` rights only, statements stop after `ELVA_QUERY_TIMEOUT`, `query` returns
+at most `ELVA_QUERY_MAX_ROWS` rows, and only one statement is accepted per call.
+
+| Setting (in `mcp.env`) | Default | |
+|---|---|---|
+| `ELVA_DATABASE_URL` | *(required)* | URL of the read-only role |
+| `ELVA_TIMEZONE` | `Europe/Stockholm` | Time zone for days, months and output |
+| `ELVA_QUERY_TIMEOUT` | `30s` | Maximum run time of one database statement |
+| `ELVA_QUERY_MAX_ROWS` | `1000` | Maximum rows returned by `query` |
+
+`elva-mcp-stdio -check` connects, shows what data exists and exits. `-version` prints
+the version. Logs go to stderr; most MCP clients show them in their logs.
+
 ## Roadmap
 
 - [x] Read electricity and water from the RCU; startup connectivity and auth check
 - [x] Store in PostgreSQL
 - [ ] Grafana dashboards
 - [x] systemd service with install, verify and uninstall scripts
+- [x] MCP server for AI assistants (`elva-mcp-stdio`)
 
 ## License
 

@@ -5,9 +5,12 @@
 #   sudo deploy/install.sh [BINARY]      # default BINARY: bin/elva
 #
 # Installs to PREFIX (default /opt/elva):
-#   PREFIX/bin/elva   binary (root-owned)
-#   PREFIX/elva.env   settings (0640 root:elva); created from .env.sample, never overwritten
-# plus /etc/systemd/system/elva.service and a system user "elva".
+#   PREFIX/bin/elva             scraper binary (root-owned)
+#   PREFIX/elva.env             its settings (0640 root:elva); from .env.sample, never overwritten
+#   PREFIX/bin/elva-mcp-stdio   MCP server, if bin/elva-mcp-stdio was built
+#   PREFIX/mcp.env              its settings (0640 root:elva-mcp); from deploy/mcp.env.sample
+# plus /etc/systemd/system/elva.service, a system user "elva" and a group "elva-mcp"
+# (members may run the MCP server).
 set -euo pipefail
 
 PREFIX=${PREFIX:-/opt/elva}
@@ -35,6 +38,23 @@ install -d -m 0755 -o root -g root "$PREFIX" "$PREFIX/bin"
 install -m 0755 -o root -g root "$BIN" "$PREFIX/bin/elva.new"
 mv -f "$PREFIX/bin/elva.new" "$PREFIX/bin/elva"
 echo "  installed $PREFIX/bin/elva"
+
+MCP=$(dirname "$BIN")/elva-mcp-stdio
+if [[ -x $MCP ]]; then
+    getent group elva-mcp >/dev/null || { groupadd --system elva-mcp; echo "  created group elva-mcp"; }
+    install -m 0755 -o root -g root "$MCP" "$PREFIX/bin/elva-mcp-stdio.new"
+    mv -f "$PREFIX/bin/elva-mcp-stdio.new" "$PREFIX/bin/elva-mcp-stdio"
+    echo "  installed $PREFIX/bin/elva-mcp-stdio"
+    if [[ ! -e $PREFIX/mcp.env ]]; then
+        install -m 0640 -o root -g elva-mcp "$REPO/deploy/mcp.env.sample" "$PREFIX/mcp.env"
+        echo "  created $PREFIX/mcp.env: set a read-only ELVA_DATABASE_URL (deploy/readonly-role.sql)"
+        echo "  allow a user to run the MCP server: sudo usermod -aG elva-mcp <user>"
+    else
+        chown root:elva-mcp "$PREFIX/mcp.env"
+        chmod 0640 "$PREFIX/mcp.env"
+        echo "  kept existing $PREFIX/mcp.env"
+    fi
+fi
 
 first=no
 if [[ ! -e $PREFIX/elva.env ]]; then

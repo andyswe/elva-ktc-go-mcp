@@ -2,8 +2,8 @@
 # Remove the ElVa service. The settings file is kept unless --purge is given.
 # The database is never touched.
 #
-#   sudo deploy/uninstall.sh            # remove service and binary, keep PREFIX/elva.env
-#   sudo deploy/uninstall.sh --purge    # also remove PREFIX and the elva user
+#   sudo deploy/uninstall.sh            # remove service and binaries, keep the *.env files
+#   sudo deploy/uninstall.sh --purge    # also remove PREFIX, the elva user and the elva-mcp group
 set -euo pipefail
 
 PREFIX=${PREFIX:-/opt/elva}
@@ -26,8 +26,11 @@ echo "removed $PREFIX/bin"
 if [[ $purge == yes ]]; then
     rm -rf "$PREFIX"
     id elva >/dev/null 2>&1 && userdel elva
-    echo "purged $PREFIX and user elva"
+    getent group elva-mcp >/dev/null && groupdel elva-mcp
+    echo "purged $PREFIX, user elva and group elva-mcp"
 else
-    [[ -e $PREFIX/elva.env ]] && echo "kept $PREFIX/elva.env (use --purge to remove it)"
+    for f in elva.env mcp.env; do
+        [[ -e $PREFIX/$f ]] && echo "kept $PREFIX/$f (use --purge to remove it)"
+    done
 fi
 echo "The database was not touched."

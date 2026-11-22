@@ -22,8 +22,8 @@ warn() { printf '  %sWARN%s  %s\n' "$Y" "$N" "$*"; warns=$((warns + 1)); }
 fail() { printf '  %sFAIL%s  %s\n' "$R" "$N" "$*"; fails=$((fails + 1)); }
 section() { printf '\n%s\n' "$*"; }
 
-# setting KEY: value of KEY in the settings file ("" if unset or commented out).
-setting() { sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\?$1=//p" "$ENV" | tail -n1 | sed "s/^[\"']//; s/[\"']\$//"; }
+# setting FILE KEY: value of KEY in a settings file ("" if unset or commented out).
+setting() { sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\?$2=//p" "$1" | tail -n1 | sed "s/^[\"']//; s/[\"']\$//"; }
 
 [[ $EUID -eq 0 ]] || { echo "verify.sh: must run as root to read the settings: sudo $0" >&2; exit 2; }
 
@@ -45,7 +45,7 @@ section "Configuration ($ENV)"
 if [[ -f $ENV ]]; then
     perms=$(stat -c '%a %U:%G' "$ENV")
     [[ $perms == "640 root:elva" ]] && ok "permissions $perms" || fail "permissions $perms, expected 640 root:elva (contains passwords)"
-    host=$(setting KTC_HOST) pw=$(setting KTC_PASSWORD) db=$(setting ELVA_DATABASE_URL)
+    host=$(setting "$ENV" KTC_HOST) pw=$(setting "$ENV" KTC_PASSWORD) db=$(setting "$ENV" ELVA_DATABASE_URL)
     [[ -n $host ]] && ok "KTC_HOST=$host" || fail "KTC_HOST not set"
     if [[ -z $pw ]]; then fail "KTC_PASSWORD not set"
     elif [[ $pw == changeme ]]; then fail "KTC_PASSWORD is still the sample value"
@@ -95,6 +95,32 @@ if [[ -x $BIN && -f $ENV ]] && id elva >/dev/null 2>&1; then
     fi
 else
     fail "skipped: binary, settings or user missing"
+fi
+
+section "MCP server (elva-mcp-stdio, optional)"
+MCPBIN=$PREFIX/bin/elva-mcp-stdio MCPENV=$PREFIX/mcp.env
+if [[ ! -x $MCPBIN ]]; then
+    echo "  -     not installed (build it with scripts/build.sh, then run sudo deploy/install.sh)"
+else
+    mver=$("$MCPBIN" -version 2>/dev/null)
+    [[ $mver == "${installed:-}" ]] && ok "binary $MCPBIN, version $mver" || warn "binary $MCPBIN is version $mver, elva is ${installed:-?}"
+    if [[ -f $MCPENV ]]; then
+        perms=$(stat -c '%a %U:%G' "$MCPENV")
+        [[ $perms == "640 root:elva-mcp" ]] && ok "settings $MCPENV, permissions $perms" || fail "permissions of $MCPENV are $perms, expected 640 root:elva-mcp"
+        mdb=$(setting "$MCPENV" ELVA_DATABASE_URL)
+        if [[ -z $mdb ]]; then fail "ELVA_DATABASE_URL not set in $MCPENV"
+        elif [[ $mdb == *changeme* ]]; then fail "ELVA_DATABASE_URL in $MCPENV still has the sample password"
+        elif [[ -n ${db:-} && ${mdb%%@*} == "${db%%@*}" ]]; then warn "the MCP server uses the same database user as elva: use a read-only role (deploy/readonly-role.sql)"
+        else ok "ELVA_DATABASE_URL set (separate user)"; fi
+        members=$(getent group elva-mcp | cut -d: -f4)
+        [[ -n $members ]] && ok "users allowed to run it (group elva-mcp): $members" || warn "no users in group elva-mcp: sudo usermod -aG elva-mcp <user>"
+        mout=$(env -i PATH=/usr/bin:/bin "$MCPBIN" -env-file "$MCPENV" -check 2>&1)
+        mcode=$?
+        grep -E 'msg=(data|"cannot|"invalid)' <<<"$mout" | sed 's/^time=[^ ]* /    /'
+        [[ $mcode -eq 0 ]] && ok "database check passed (read-only connection)" || fail "elva-mcp-stdio -check failed with exit code $mcode"
+    else
+        fail "no settings file at $MCPENV: run sudo deploy/install.sh"
+    fi
 fi
 
 section "Recent warnings (last hour)"

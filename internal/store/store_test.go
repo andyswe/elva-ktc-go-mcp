@@ -3,8 +3,9 @@ package store
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
+
+	"github.com/andyswe/elva-ktc-go-mcp/internal/testdb"
 	"time"
 )
 
@@ -13,10 +14,7 @@ import (
 // Never point it at a database with real data: the table is truncated.
 func openTest(t *testing.T) *Store {
 	t.Helper()
-	url := os.Getenv("ELVA_TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("ELVA_TEST_DATABASE_URL not set; skipping PostgreSQL test")
-	}
+	url := testdb.URL(t, "test_store")
 	ctx := context.Background()
 	s, err := Open(ctx, url)
 	if err != nil {
@@ -28,8 +26,6 @@ func openTest(t *testing.T) *Store {
 	}
 	return s
 }
-
-func ptr[T any](v T) *T { return &v }
 
 func TestInsert(t *testing.T) {
 	s := openTest(t)

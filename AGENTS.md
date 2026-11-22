@@ -26,13 +26,26 @@ keep anything specific to one installation out of this file.
    as `.env.<name>`. Tests use the fake password `secret`, and test fixtures must not
    contain real names, serial numbers or addresses.
 4. **Use the standard library only, unless a dependency clearly pays for itself.** The
-   only dependency today is `github.com/jackc/pgx/v5`, because Go has no built-in
-   PostgreSQL driver.
-5. **Define every setting in the `settings` table in `cmd/elva/config.go`.** Don't call
-   `os.Getenv` anywhere else. The table drives `-help` and the startup settings log,
-   and secrets must not leak into logs. Mark a setting `secret: true` if it holds a
-   credential; names containing PASSWORD, SECRET or TOKEN and passwords inside URLs
-   are masked anyway. Also add every new setting to `.env.sample` and README.md.
+   only direct dependencies are `github.com/jackc/pgx/v5` (Go has no built-in
+   PostgreSQL driver) and `github.com/modelcontextprotocol/go-sdk` (the official MCP
+   SDK).
+5. **Define every setting in its binary's `settings` table.** That is
+   `cmd/elva/config.go` for the scraper and `cmd/elva-mcp-stdio/main.go` for the MCP
+   server; both use `internal/config`. Don't call `os.Getenv` anywhere else. The table
+   drives `-help` and the startup settings log, and secrets must not leak into logs.
+   Mark a setting `Secret: true` if it holds a credential; names containing PASSWORD,
+   SECRET or TOKEN and passwords inside URLs are masked anyway. Also add every new
+   setting to `.env.sample` (scraper) or `deploy/mcp.env.sample` (MCP server), and to
+   README.md.
+6. **The MCP server must stay read-only and bounded.** Keep every safety layer:
+   - the session is read-only (`default_transaction_read_only`), and `query` also runs
+     in a read-only transaction;
+   - the statement timeout and the row limit;
+   - single statements only (pgx's extended protocol);
+   - a `SELECT`-only role (`deploy/readonly-role.sql`).
+
+   Tool output goes into a model's context, so keep answers small: cap the number of
+   buckets and points, and group long ranges, as `get_baseload` does.
 
 ## Build, test, run
 
@@ -56,9 +69,13 @@ To check the startup failure paths:
 
 ### Database tests
 
-`internal/store` tests run against a real PostgreSQL when `ELVA_TEST_DATABASE_URL` is
-set, and are skipped otherwise. **They truncate the `measurement` table**, so use a
-throwaway database only:
+Tests in `internal/store` and `cmd/elva-mcp-stdio` run against a real PostgreSQL when
+`ELVA_TEST_DATABASE_URL` is set, and are skipped otherwise.
+- `internal/testdb` gives each test package its own schema (`?search_path=...`), so
+  packages running in parallel don't collide.
+- **It drops and recreates that schema**, so use a throwaway database only.
+- The read tests use a synthetic dataset covering a DST change, a gap and a night
+  "leak".
 
 ```sh
 docker run -d --rm --name elva-test-pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=elva \
@@ -101,16 +118,24 @@ written", and the table should have no gap.
 | `cmd/elva/main.go` | Startup checks (database, RCU), minute loop, cursor restore, meter freshness check (`meterAgeProblem`), database write or JSON output |
 | `cmd/elva/row.go` | Maps readings to columns by quantity (`toRow`), with unit conversion; rejects two meters filling one column |
 | `cmd/elva/buffer.go` | In-memory row buffer for database outages (`ELVA_DATABASE_BUFFER`), flushed oldest first in chunks |
-| `cmd/elva/config.go` | Settings table, `-env-file` loader, value sources, secret masking, `-help` text |
+| `cmd/elva/config.go` | The scraper's settings table and `parseConfig` |
+| `cmd/elva-mcp-stdio/main.go` | MCP server: settings, read-only database connection, `-check`, stdio transport |
+| `cmd/elva-mcp-stdio/tools.go` | Tool definitions and handlers, server instructions, the `elva://schema` resource |
+| `cmd/elva-mcp-stdio/when.go` | Parses time inputs (`2026-11`, `-7d`, RFC 3339, ...) in local time |
+| `internal/config/config.go` | Shared settings machinery: env file, sources, secret masking, `-help` |
 | `internal/ktc/client.go` | HTTP client: `Login`, `ReadMeter`, `Cursor`, `SetCursor`; error kinds `ErrUnreachable`, `ErrAuth` |
 | `internal/ktc/parse.go` | Start page and `mb.xml` parsing, VIF unit table |
 | `internal/ktc/testdata/` | Anonymized responses captured from an RCU1111-1100 (firmware 4.7.13) |
 | `internal/ktc/ktc_test.go` | Parser tests and a fake RCU (`newFakeRCU`) that models the session and cursor |
-| `internal/store/store.go` | PostgreSQL: `Open` (connect, create schema), `Insert` (one `unnest` statement, `ON CONFLICT DO NOTHING`), `Latest`, `Schema` |
-| `scripts/build.sh` | Builds `bin/elva` with `-X main.version=$(git describe --tags --always --dirty)` |
+| `internal/store/store.go` | PostgreSQL writer: `Open` (connect, create schema), `Insert` (one `unnest` statement, `ON CONFLICT DO NOTHING`), `Latest`, `Schema` |
+| `internal/store/read.go` | Read-only `Reader` for the MCP server: `Consumption`, `Timeseries`, `Baseload`, `Info`, `Query` |
+| `internal/testdb/testdb.go` | Test helper: a fresh schema per test package in the test PostgreSQL |
+| `scripts/build.sh` | Builds `bin/elva` and `bin/elva-mcp-stdio` with `-X main.version=$(git describe --tags --always --dirty)` |
 | `deploy/elva.service` | systemd unit template (`@PREFIX@` is replaced by `install.sh`) |
-| `deploy/install.sh` | Install or upgrade: user `elva`, `PREFIX/bin/elva`, `PREFIX/elva.env` (never overwritten), unit; enable and restart |
-| `deploy/verify.sh` | Checks files, permissions, settings, unit drift, service state, then `elva -check`, last-row age and journal warnings |
+| `deploy/install.sh` | Install or upgrade: user `elva`, `PREFIX/bin/elva`, `PREFIX/elva.env` (never overwritten), unit; enable and restart. Also `elva-mcp-stdio`, group `elva-mcp` and `PREFIX/mcp.env` (0640 root:elva-mcp) |
+| `deploy/verify.sh` | Checks files, permissions, settings, unit drift, service state, then `elva -check`, last-row age, the MCP server (`-check`, group members) and journal warnings |
+| `deploy/mcp.env.sample` | Template for `PREFIX/mcp.env` |
+| `deploy/readonly-role.sql` | Creates the `SELECT`-only role `elva_ro` for the MCP server |
 | `deploy/uninstall.sh` | Removes the service and binary; `--purge` also removes `PREFIX` and the user. Never touches the database |
 
 ## How the RCU web UI works
@@ -234,6 +259,34 @@ CREATE TABLE IF NOT EXISTS measurement (
   numbered migrations.
 - **Scale:** about 525 k rows per year. Plain PostgreSQL with the primary key index is
   enough; no TimescaleDB or extra indexes are needed.
+
+**MCP server (implemented): `elva-mcp-stdio`.**
+- **Separate binary:** it is read-only and started on demand by the client, while the
+  scraper is a writing daemon. It has its own settings (`mcp.env`) and its own
+  database role.
+- **stdio transport**, typically started over SSH on the database host:
+  `ssh host /opt/elva/bin/elva-mcp-stdio -env-file /opt/elva/mcp.env`. There is no
+  network port and no extra authentication; access is granted by membership of the
+  group `elva-mcp`, which can read `mcp.env`.
+- **Tools** (all marked read-only):
+  - `get_latest`;
+  - `get_consumption`: deltas of the totals per `date_trunc` bucket, with a baseline
+    from the last row before the range, at most 1000 buckets;
+  - `get_timeseries`: `date_bin`, at most 2000 points;
+  - `get_baseload`: per night within a local window; per week or month beyond 62 or
+    366 nights;
+  - `get_data_info`: gaps via `lag()`;
+  - `query`.
+
+  The resource is `elva://schema`.
+- **Time:** `ELVA_TIMEZONE` sets the session time zone and the bucket boundaries;
+  outputs are local RFC 3339.
+- **Measured** on 3.1 M synthetic rows (6 years) with PostgreSQL 17: each tool takes
+  1-3.5 s, and the largest answers are about 10 KB (month buckets) and 30 KB (500
+  timeseries points).
+- **Testing:** `main_test.go` connects a real MCP client over in-memory transports and
+  calls every tool. For a manual stdio test, pipe JSON-RPC lines into the binary
+  (`initialize`, `notifications/initialized`, `tools/call`).
 
 **Grafana** reads directly from PostgreSQL.
 
