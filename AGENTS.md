@@ -32,11 +32,15 @@ keep anything specific to one installation out of this file.
 5. **Define every setting in its binary's `settings` table.** That is
    `cmd/elva/config.go` for the scraper and `cmd/elva-mcp-stdio/main.go` for the MCP
    server; both use `internal/config`. Don't call `os.Getenv` anywhere else. The table
-   drives `-help` and the startup settings log, and secrets must not leak into logs.
-   Mark a setting `Secret: true` if it holds a credential; names containing PASSWORD,
-   SECRET or TOKEN and passwords inside URLs are masked anyway. Also add every new
-   setting to `.env.sample` (scraper) or `deploy/mcp.env.sample` (MCP server), and to
-   README.md.
+   drives the command-line flags, `-help` and the startup settings log, and secrets
+   must not leak into logs.
+   - Mark a setting `Secret: true` if it holds a credential; names containing
+     PASSWORD, SECRET or TOKEN and passwords inside URLs are masked anyway.
+   - Every setting automatically gets a flag (`config.FlagName`: `ELVA_` dropped,
+     lower case, dashes). Pick names whose flag reads well and doesn't clash with
+     `-check`, `-version`, `-env-file` or `-help`.
+   - Also add every new setting to `.env.sample` (scraper) or `deploy/mcp.env.sample`
+     (MCP server), and to README.md's settings tables, with its flag.
 6. **The MCP server must stay read-only and bounded.** Keep every safety layer:
    - the session is read-only (`default_transaction_read_only`), and `query` also runs
      in a read-only transaction;
@@ -98,7 +102,13 @@ written", and the table should have no gap.
 
 ### Configuration loading
 
-- Settings are read from the environment, which follows the 12-factor convention.
+- **Priority:** flag, then environment, then `-env-file`, then default.
+  `config.Resolve` implements it and the startup log shows each value's source.
+- Settings are mainly read from the environment, which follows the 12-factor
+  convention.
+- **Flags** are a convenience for containers and MCP client configs. An empty flag
+  counts as not given. A secret from a flag works but logs a warning, because other
+  local users can see a process's arguments.
 - `-env-file` is an opt-in convenience for running by hand: nothing is loaded
   automatically. Values already in the environment win over the file, so a
   deployment can override a single value.
@@ -132,7 +142,7 @@ written", and the table should have no gap.
 | `cmd/elva-mcp-stdio/tools.go` | Tool definitions and handlers, server instructions, the `elva://schema` resource |
 | `cmd/elva-mcp-stdio/schema.go` | `schemaFor`: portable JSON Schemas for tool inputs and outputs (rule 7) |
 | `cmd/elva-mcp-stdio/when.go` | Parses time inputs (`2026-11`, `-7d`, RFC 3339, ...) in local time |
-| `internal/config/config.go` | Shared settings machinery: env file, sources, secret masking, `-help` |
+| `internal/config/config.go` | Shared settings machinery: flags (`Flags`, `FlagName`), env file, priority and sources, secret masking, `-help` |
 | `internal/ktc/client.go` | HTTP client: `Login`, `ReadMeter`, `Cursor`, `SetCursor`; error kinds `ErrUnreachable`, `ErrAuth` |
 | `internal/ktc/parse.go` | Start page and `mb.xml` parsing, VIF unit table |
 | `internal/ktc/testdata/` | Anonymized responses captured from an RCU1111-1100 (firmware 4.7.13) |

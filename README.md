@@ -112,23 +112,32 @@ exits without scraping. The version is also the first line of every startup log.
 
 ## Configuration
 
-Set these as environment variables or put them in a file passed with `-env-file`.
-Variables already set in the environment take precedence over the file.
-`./bin/elva -help` lists all settings. At startup ElVa logs every setting's value and
-where it came from (`environment`, `env file`, `default` or `none`). Passwords and
-other secrets are masked, including passwords inside connection URLs.
+Each setting can be given in three ways. When a setting is given more than once, the
+first of these wins, and the default applies only if it's given nowhere:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `KTC_HOST` | *(required)* | Host or `host:port` of the RCU, e.g. `192.168.1.100` |
-| `KTC_PASSWORD` | *(required)* | RCU web UI password |
-| `KTC_METERS` | all meters | Comma-separated meter names to read, e.g. `EL-01,VV-01` |
-| `KTC_TIMEZONE` | `Europe/Stockholm` | Time zone of the RCU's clock; its timestamps carry none |
-| `ELVA_INTERVAL` | `1m` | Scrape interval, aligned to the wall clock (whole minutes) |
-| `ELVA_TIMEOUT` | `10s` | Timeout per request to the RCU and per database operation |
-| `ELVA_MAX_METER_AGE` | `2m` | Warn when the RCU's last read of a meter is older than this |
-| `ELVA_DATABASE_URL` | *(unset)* | PostgreSQL URL, e.g. `postgres://elva:pw@localhost:5432/elva`. Unset: print JSON to stdout |
-| `ELVA_DATABASE_BUFFER` | `168h` | How long to keep readings in memory while the database is unreachable |
+1. a **command-line flag**, e.g. `-ktc-host 192.168.1.100`;
+2. an **environment variable**, e.g. `KTC_HOST=192.168.1.100`;
+3. a line in a **file** passed with `-env-file`, in the same `KEY=VALUE` form.
+
+The flag is the variable's name in lower case with dashes, without the `ELVA_` prefix.
+Prefer the environment or a file for passwords: other users on the machine can see a
+process's flags (`ps`), and ElVa logs a warning when a secret comes from a flag.
+
+`./bin/elva -help` lists all settings. At startup ElVa logs every setting's value and
+where it came from (`flag`, `environment`, `env file`, `default` or `none`).
+Passwords and other secrets are masked, including passwords inside connection URLs.
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `KTC_HOST` | `-ktc-host` | *(required)* | Host or `host:port` of the RCU, e.g. `192.168.1.100` |
+| `KTC_PASSWORD` | `-ktc-password` | *(required)* | RCU web UI password |
+| `KTC_METERS` | `-ktc-meters` | all meters | Comma-separated meter names to read, e.g. `EL-01,VV-01` |
+| `KTC_TIMEZONE` | `-ktc-timezone` | `Europe/Stockholm` | Time zone of the RCU's clock; its timestamps carry none |
+| `ELVA_INTERVAL` | `-interval` | `1m` | Scrape interval, aligned to the wall clock (whole minutes) |
+| `ELVA_TIMEOUT` | `-timeout` | `10s` | Timeout per request to the RCU and per database operation |
+| `ELVA_MAX_METER_AGE` | `-max-meter-age` | `2m` | Warn when the RCU's last read of a meter is older than this |
+| `ELVA_DATABASE_URL` | `-database-url` | *(unset)* | PostgreSQL URL, e.g. `postgres://elva:pw@localhost:5432/elva`. Unset: print JSON to stdout |
+| `ELVA_DATABASE_BUFFER` | `-database-buffer` | `168h` | How long to keep readings in memory while the database is unreachable |
 
 The RCU itself reads the meters once a minute, so an interval shorter than `1m` only
 repeats the same values.
@@ -370,14 +379,29 @@ table):
 
 **Safety:** the server can only read. Its database sessions are read-only, the role
 has `SELECT` rights only, statements stop after `ELVA_QUERY_TIMEOUT`, `query` returns
-at most `ELVA_QUERY_MAX_ROWS` rows, and only one statement is accepted per call.
+at most `ELVA_QUERY_MAX_ROWS` rows (marking the answer `"truncated": true` when there
+were more), and only one statement is accepted per call.
 
-| Setting (in `mcp.env`) | Default | |
-|---|---|---|
-| `ELVA_DATABASE_URL` | *(required)* | URL of the read-only role |
-| `ELVA_TIMEZONE` | `Europe/Stockholm` | Time zone for days, months and output |
-| `ELVA_QUERY_TIMEOUT` | `30s` | Maximum run time of one database statement |
-| `ELVA_QUERY_MAX_ROWS` | `1000` | Maximum rows returned by `query` |
+| Variable | Flag | Default | |
+|---|---|---|---|
+| `ELVA_DATABASE_URL` | `-database-url` | *(required)* | URL of the read-only role |
+| `ELVA_TIMEZONE` | `-timezone` | `Europe/Stockholm` | Time zone for days, months and output |
+| `ELVA_QUERY_TIMEOUT` | `-query-timeout` | `30s` | Maximum run time of one database statement |
+| `ELVA_QUERY_MAX_ROWS` | `-query-max-rows` | `1000` | Maximum rows returned by `query` |
+
+**Without `mcp.env`**, e.g. in a container: settings work as for `elva` (see
+[Configuration](#configuration)), as flags, environment variables or both. Flags win.
+Keep the password out of the flags, because other users on the machine can see them;
+pass the URL through the client's `env` block instead:
+
+```json
+{ "mcpServers": { "elva": {
+    "command": "docker",
+    "args": ["run", "-i", "--rm", "--network", "host", "-e", "ELVA_DATABASE_URL",
+             "your-image", "elva-mcp-stdio", "-timezone", "Europe/Stockholm"],
+    "env": { "ELVA_DATABASE_URL": "postgres://elva_ro:a-strong-password@localhost:5432/elva" }
+} } }
+```
 
 `elva-mcp-stdio -check` connects, shows what data exists and exits (exit code 1 for
 bad settings, 5 if the database can't be reached). `-version` prints the version.

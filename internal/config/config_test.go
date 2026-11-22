@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,13 +46,15 @@ func TestResolve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vs := Resolve(settings, fromFile)
+	t.Setenv("T_TIMEOUT", "20s")
+	flags := map[string]string{"T_TIMEOUT": "5s", "T_INTERVAL": "", "T_OPTIONAL": "x"}
+	vs := Resolve(settings, flags, fromFile)
 	want := map[string][2]string{
 		"T_HOST":     {"from-env", "environment"}, // the environment wins over the file
 		"T_PASSWORD": {"pw", "env file"},
-		"T_OPTIONAL": {"", "none"},
-		"T_INTERVAL": {"30s", "env file"},
-		"T_TIMEOUT":  {"10s", "default"},
+		"T_OPTIONAL": {"x", "flag"},
+		"T_INTERVAL": {"30s", "env file"}, // an empty flag counts as not given
+		"T_TIMEOUT":  {"5s", "flag"},      // a flag wins over the environment
 	}
 	for _, v := range vs {
 		if w := want[v.Name]; v.Value != w[0] || v.Source != w[1] {
@@ -66,11 +70,41 @@ func TestResolve(t *testing.T) {
 
 	os.Unsetenv("T_HOST") // T_PASSWORD was set by the env file
 	os.Unsetenv("T_PASSWORD")
-	empty := Resolve(settings[:2], nil)
+	empty := Resolve(settings[:2], nil, nil)
 	if err := empty.CheckRequired(); err == nil || !strings.Contains(err.Error(), "T_HOST, T_PASSWORD") {
 		t.Errorf("CheckRequired on empty = %v", err)
 	}
 	if _, err := (Values{{Setting: Setting{Name: "X"}, Value: "soon"}}).Duration("X"); err == nil {
 		t.Error("bad duration accepted")
+	}
+}
+
+func TestFlags(t *testing.T) {
+	settings := []Setting{
+		{Name: "ELVA_QUERY_MAX_ROWS", Default: "1000", Help: "row limit"},
+		{Name: "KTC_HOST", Required: true, Help: "RCU host"},
+		{Name: "KTC_PASSWORD"},
+	}
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	check := fs.Bool("check", false, "run checks")
+	given := Flags(fs, settings)
+	if err := fs.Parse([]string{"-check", "-ktc-host", "rcu", "-query-max-rows=5"}); err != nil {
+		t.Fatal(err)
+	}
+	got := given()
+	if !*check || len(got) != 2 || got["KTC_HOST"] != "rcu" || got["ELVA_QUERY_MAX_ROWS"] != "5" {
+		t.Errorf("given = %v, check = %v", got, *check)
+	}
+
+	var help bytes.Buffer
+	PrintHelp(&help, fs, settings)
+	for _, want := range []string{"  -check\n        run checks", "  -query-max-rows, ELVA_QUERY_MAX_ROWS (default 1000)\n        row limit",
+		"  -ktc-host, KTC_HOST (required)"} {
+		if !strings.Contains(help.String(), want) {
+			t.Errorf("help lacks %q:\n%s", want, help.String())
+		}
+	}
+	if strings.Contains(help.String(), "  -ktc-host string") {
+		t.Errorf("setting flags listed twice:\n%s", help.String())
 	}
 }

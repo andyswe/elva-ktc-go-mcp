@@ -1,10 +1,14 @@
-// Package config loads settings from the environment and an optional env file,
-// logs them with secrets masked, and prints -help text. Each binary declares its
-// own []Setting table; that table is the single place a setting is defined.
+// Package config loads settings from command-line flags, the environment and an
+// optional env file, logs them with secrets masked, and prints -help text. Each
+// binary declares its own []Setting table; that table is the single place a setting
+// is defined, and every setting gets a flag named after it (see FlagName).
+//
+// Priority: flag, then environment, then env file, then default.
 package config
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -27,15 +31,43 @@ type Setting struct {
 type Value struct {
 	Setting
 	Value  string
-	Source string // "environment", "env file", "default" or "none"
+	Source string // "flag", "environment", "env file", "default" or "none"
 }
 
 // Values are the resolved settings of one binary.
 type Values []Value
 
+// FlagName is the command-line flag of a setting: the name without the ELVA_ prefix,
+// in lower case with dashes, e.g. ELVA_QUERY_TIMEOUT -> query-timeout, KTC_HOST -> ktc-host.
+func FlagName(name string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(name, "ELVA_")), "_", "-")
+}
+
+// Flags registers a string flag for every setting on fs. After fs.Parse, the
+// returned function gives the values of the flags actually given, by setting name.
+func Flags(fs *flag.FlagSet, settings []Setting) func() map[string]string {
+	ptrs := map[string]*string{}
+	names := map[string]string{}
+	for _, s := range settings {
+		f := FlagName(s.Name)
+		ptrs[f] = fs.String(f, "", s.Help+" ("+s.Name+")")
+		names[f] = s.Name
+	}
+	return func() map[string]string {
+		given := map[string]string{}
+		fs.Visit(func(f *flag.Flag) {
+			if p, ok := ptrs[f.Name]; ok {
+				given[names[f.Name]] = *p
+			}
+		})
+		return given
+	}
+}
+
 // Load reads envFile (if not empty) into the environment, resolves every setting
-// and logs them with secrets masked.
-func Load(log *slog.Logger, settings []Setting, envFile string) (Values, error) {
+// with flags (by setting name, from Flags) taking priority, and logs them with
+// secrets masked.
+func Load(log *slog.Logger, settings []Setting, flags map[string]string, envFile string) (Values, error) {
 	var fromFile map[string]bool
 	if envFile != "" {
 		var err error
@@ -44,19 +76,26 @@ func Load(log *slog.Logger, settings []Setting, envFile string) (Values, error) 
 		}
 		log.Info("loaded env file", "path", envFile)
 	}
-	vs := Resolve(settings, fromFile)
+	vs := Resolve(settings, flags, fromFile)
 	for _, v := range vs {
 		log.Info("setting", "name", v.Name, "value", v.Display(), "source", v.Source)
+		if v.Source == "flag" && v.Display() != v.Value {
+			log.Warn("a secret given as a flag is visible to other local users (ps); prefer the environment",
+				"flag", "-"+FlagName(v.Name), "env", v.Name)
+		}
 	}
 	return vs, nil
 }
 
-// Resolve looks up every setting. fromFile holds the names set by the env file.
-func Resolve(settings []Setting, fromFile map[string]bool) Values {
+// Resolve looks up every setting. flags holds the values given as flags, by setting
+// name; fromFile holds the names set by the env file.
+func Resolve(settings []Setting, flags map[string]string, fromFile map[string]bool) Values {
 	out := make(Values, len(settings))
 	for i, s := range settings {
 		v := Value{Setting: s, Source: "none"}
-		if x, ok := os.LookupEnv(s.Name); ok && x != "" {
+		if x := flags[s.Name]; x != "" {
+			v.Value, v.Source = x, "flag"
+		} else if x, ok := os.LookupEnv(s.Name); ok && x != "" {
 			v.Value, v.Source = x, "environment"
 			if fromFile[s.Name] {
 				v.Source = "env file"
@@ -165,9 +204,22 @@ func LoadEnvFile(path string) (map[string]bool, error) {
 	return set, sc.Err()
 }
 
-// PrintHelp writes the settings table for -help.
-func PrintHelp(w io.Writer, settings []Setting) {
-	fmt.Fprintln(w, "\nSettings (environment variables; also accepted in the -env-file file):")
+// PrintHelp writes -help: the flags of fs that are not settings, then the settings.
+func PrintHelp(w io.Writer, fs *flag.FlagSet, settings []Setting) {
+	isSetting := map[string]bool{}
+	for _, s := range settings {
+		isSetting[FlagName(s.Name)] = true
+	}
+	fmt.Fprintln(w, "Options:")
+	fs.VisitAll(func(f *flag.Flag) {
+		if !isSetting[f.Name] {
+			arg, usage := flag.UnquoteUsage(f)
+			fmt.Fprintf(w, "  %s\n        %s\n", strings.TrimSpace("-"+f.Name+" "+arg), usage)
+		}
+	})
+	fmt.Fprintln(w, "\nSettings, each as a flag or an environment variable (also accepted in the -env-file")
+	fmt.Fprintln(w, "file). Priority: flag, environment, env file, default. Prefer the environment for")
+	fmt.Fprintln(w, "secrets: flags are visible to other local users.")
 	for _, s := range settings {
 		extra := ""
 		switch {
@@ -176,6 +228,6 @@ func PrintHelp(w io.Writer, settings []Setting) {
 		case s.Default != "":
 			extra = " (default " + s.Default + ")"
 		}
-		fmt.Fprintf(w, "  %-21s %s%s\n", s.Name, s.Help, extra)
+		fmt.Fprintf(w, "  -%s, %s%s\n        %s\n", FlagName(s.Name), s.Name, extra, s.Help)
 	}
 }

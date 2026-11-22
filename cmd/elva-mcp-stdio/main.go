@@ -7,6 +7,10 @@
 //
 //	ssh host /opt/elva/bin/elva-mcp-stdio -env-file /opt/elva/mcp.env
 //
+// or with settings as flags or environment variables, e.g. in a container:
+//
+//	elva-mcp-stdio -database-url postgres://elva_ro@db/elva -timezone Europe/Stockholm
+//
 // stdout carries the MCP protocol; logs go to stderr.
 package main
 
@@ -49,11 +53,11 @@ func main() {
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	check := flag.Bool("check", false, "connect to the database, show what data exists, then exit")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-env-file FILE] [-check] [-version]\n\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options] [-setting value ...]\n\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "MCP server (stdio) for ElVa data. Started by an MCP client, not by hand.\n\n")
-		flag.PrintDefaults()
-		config.PrintHelp(flag.CommandLine.Output(), settings)
+		config.PrintHelp(flag.CommandLine.Output(), flag.CommandLine, settings)
 	}
+	given := config.Flags(flag.CommandLine, settings)
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -62,7 +66,7 @@ func main() {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	log.Info("elva-mcp-stdio starting", "version", version, "check_only", *check)
-	vs, err := config.Load(log, settings, *envFile)
+	vs, err := config.Load(log, settings, given(), *envFile)
 	if err != nil {
 		log.Error("cannot load env file", "err", err)
 		os.Exit(exitConfig)

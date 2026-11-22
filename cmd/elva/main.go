@@ -1,9 +1,10 @@
 // Command elva reads electricity and water meters from a KTC RCU every minute and
 // stores them in PostgreSQL (or prints them as JSON lines when no database is set).
 //
-// Configuration is read from the environment, optionally loaded from a file with
-// -env-file (variables already set in the environment win). All settings are
-// defined in config.go and logged at startup with secrets masked.
+// Each setting can be given as a flag (-ktc-host) or an environment variable
+// (KTC_HOST), or loaded from a file with -env-file. Priority: flag, environment,
+// file, default. All settings are defined in config.go and logged at startup with
+// secrets masked.
 //
 // Logs go to stderr.
 package main
@@ -45,10 +46,10 @@ func main() {
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	check := flag.Bool("check", false, "run the startup checks (config, database, RCU test read), then exit")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-env-file FILE] [-check] [-version]\n\n", os.Args[0])
-		flag.PrintDefaults()
-		config.PrintHelp(flag.CommandLine.Output(), settings)
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options] [-setting value ...]\n\n", os.Args[0])
+		config.PrintHelp(flag.CommandLine.Output(), flag.CommandLine, settings)
 	}
+	given := config.Flags(flag.CommandLine, settings)
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -58,7 +59,7 @@ func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	log.Info("ElVa starting", "version", version, "check_only", *check)
 
-	vs, err := config.Load(log, settings, *envFile)
+	vs, err := config.Load(log, settings, given(), *envFile)
 	if err != nil {
 		log.Error("cannot load env file", "err", err)
 		os.Exit(exitConfig)
