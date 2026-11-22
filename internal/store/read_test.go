@@ -81,8 +81,8 @@ func TestReader(t *testing.T) {
 	})
 
 	t.Run("consumption per day", func(t *testing.T) {
-		days, err := r.Consumption(ctx, from, to, "day")
-		if err != nil || len(days) != 3 {
+		days, gaps, err := r.Consumption(ctx, from, to, "day")
+		if err != nil || len(days) != 3 || len(gaps) != 0 { // the gap is inside a day
 			t.Fatalf("Consumption = %d days, %v", len(days), err)
 		}
 		// 28th: 4 h x 100 W + 20 h x 500 W = 10.4 kWh. 29th (23 h, the night loses
@@ -112,12 +112,29 @@ func TestReader(t *testing.T) {
 	})
 
 	t.Run("consumption with a baseline before the range", func(t *testing.T) {
-		days, err := r.Consumption(ctx, from.AddDate(0, 0, 1), to, "day")
+		days, _, err := r.Consumption(ctx, from.AddDate(0, 0, 1), to, "day")
 		if err != nil || len(days) != 2 || days[0].Partial {
 			t.Fatalf("Consumption = %+v, %v", days, err)
 		}
-		if _, err := r.Consumption(ctx, from, to, "fortnight"); err == nil {
+		if _, _, err := r.Consumption(ctx, from, to, "fortnight"); err == nil {
 			t.Error("bad bucket accepted")
+		}
+	})
+
+	t.Run("consumption after a long gap", func(t *testing.T) {
+		day := from.AddDate(0, 0, 2) // the 30th, no rows 10:00-12:00
+		hours, gaps, err := r.Consumption(ctx, day, day.AddDate(0, 0, 1), "hour")
+		if err != nil || len(hours) != 22 || len(gaps) != 1 {
+			t.Fatalf("Consumption = %d hours, gaps %+v, %v", len(hours), gaps, err)
+		}
+		// The 12:00 hour counts from 12:00, not from 09:59: 0.5 kWh, not 1.5.
+		noon := hours[10]
+		if noon.Start.Hour() != 12 || !noon.Partial || math.Abs(*noon.ElKWh-0.5) > 0.15 || hours[9].Partial {
+			t.Errorf("12:00 = %+v (%v kWh)", noon, deref(noon.ElKWh))
+		}
+		g := gaps[0]
+		if g.From.Format("15:04") != "09:59" || g.To.Format("15:04") != "12:00" || math.Abs(*g.ElKWh-1.0) > 0.15 || *g.WaterL != 7 { // 10:00..11:40 and 12:00 (counted before its row)
+			t.Errorf("gap = %v-%v %v kWh %v l", g.From, g.To, deref(g.ElKWh), *g.WaterL)
 		}
 	})
 

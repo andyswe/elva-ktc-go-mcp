@@ -337,13 +337,18 @@ to be exposed to the network, and your SSH key is the authentication.
 | Tool | What it answers |
 |------|-----------------|
 | `get_latest` | Power right now, water flow, meter totals, and how old the reading is |
-| `get_consumption` | kWh and litres per hour, day, week, month or year (from the meter totals, so correct across gaps and DST), with average and peak power |
+| `get_consumption` | kWh and litres per hour, day, week, month or year (from the meter totals, so correct across DST), with average and peak power. Consumption during an outage of more than an hour is listed separately under `gaps`, because the totals don't say when it happened: a period after a month-long outage shows only its own use |
 | `get_timeseries` | Power or water flow over time, downsampled to 500 steps by default, at most 2000 (min/avg/max per step) |
 | `get_baseload` | Standby power and water use per night (default 01:00-05:00), typical baseload, kWh per year and trend. Grouped per week or month for long ranges |
 | `get_data_info` | Rows, first and last reading, and gaps |
+| `get_schema` | The table, its units and how consumption is computed, for when a value looks off or before writing SQL |
 | `query` | Any single read-only SQL statement (row limit, statement timeout). Cells are strings, numbers, booleans or null; times are local, and JSON or array values come back as their JSON text |
 
-It also offers the resource `elva://schema`, describing the table and its units. Times
+Every answer except `query` and `get_schema` includes `earliest_data`, the oldest stored
+reading, so it is obvious when a new database only holds a few hours; a range that
+starts before it gets a note. The tool descriptions include Swedish words (el,
+elförbrukning, nattförbrukning, toppeffekt, senaste veckan, ...) so that clients that
+search tools by keyword find them. Times
 in and out are local (`ELVA_TIMEZONE`, default `Europe/Stockholm`). Inputs accept
 `2026-11-22`, `2026-11`, `2026-11-22T14:00` or relative values like `-7d` and `-3mo`.
 

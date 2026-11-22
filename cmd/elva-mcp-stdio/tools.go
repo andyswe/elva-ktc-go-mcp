@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -15,17 +16,26 @@ import (
 )
 
 const instructions = `ElVa records an apartment's electricity and water meters once a minute (read from
-a KTC RCU M-Bus node) into PostgreSQL. Use these tools to answer questions about
-consumption, power use, standby load and water use.
+a KTC RCU M-Bus node) into PostgreSQL. Use these tools for every question about
+electricity or water consumption: there is no other data source. That covers el,
+elförbrukning, energy in kWh, power and peak power (effekt, toppeffekt), standby and
+night use (nattförbrukning, standby, baslast), water (vatten, varmvatten, liter) and
+periods like "last week", "senaste veckan" or "senaste månaden".
 
 - Times: all output is local time with UTC offset. Inputs accept 2026-11-22, 2026-11,
   2026-11-22T14:00, RFC 3339, or relative values like -7d, -3mo, now.
 - Electricity: el_energy is the meter total in Wh and only moves in 100 Wh steps, so use
   power (W) for short-term detail and get_consumption for energy over periods.
 - Water: va_volume is the meter total in litres. The water meter may cover hot water only.
-- Gaps: periods without rows happen (outages). Consumption computed from totals stays
-  correct across gaps; check coverage_pct and get_data_info before trusting averages.
-- Prefer get_consumption, get_timeseries and get_baseload; use query for anything else.`
+- Gaps: periods without rows happen, from minutes to months (outages). get_consumption
+  counts a gap of up to an hour in the period after it; after a longer gap the period
+  counts from its own first reading (partial) and the gap's consumption is reported
+  separately under gaps, because the totals don't say when it was used. Check
+  coverage_pct and get_data_info before trusting averages or comparing periods.
+- earliest_data in every answer is the oldest stored reading: nothing exists before it,
+  so a new installation may only have hours of data.
+- Prefer get_consumption, get_timeseries and get_baseload; use query for anything else,
+  and get_schema when a value looks off.`
 
 const schemaDoc = `# ElVa database
 
@@ -73,26 +83,28 @@ type server struct {
 
 func (s *server) ts(t time.Time) string { return t.In(s.loc).Format(time.RFC3339) }
 
-// newServer builds the MCP server with all tools and the schema resource.
+// newServer builds the MCP server with all tools.
 func newServer(log *slog.Logger, s *server) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "elva", Title: "ElVa electricity and water", Version: version},
 		&mcp.ServerOptions{Instructions: instructions})
 	ro := &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: ptr(false)}
 
 	add(log, srv, &mcp.Tool{Name: "get_latest", Annotations: ro,
-		Description: "Latest stored reading: momentary power (W) and water flow, meter totals, and how old the reading is."},
+		Description: "Latest stored reading: power right now (W, effekt just nu) and water flow, meter totals, " +
+			"how old the reading is, and the oldest stored reading (earliest_data)."},
 		s.latest)
 	add(log, srv, &mcp.Tool{Name: "get_consumption", Annotations: ro,
-		Description: "Electricity (kWh) and water (litres) used per hour, day, week, month or year, computed from the " +
-			"meter totals (correct across gaps and DST), with average and peak power per period. " +
+		Description: "Electricity (kWh) and water (litres) used per hour, day, week, month or year " +
+			"(elförbrukning, vattenförbrukning, e.g. last week, senaste veckan, senaste månaden), computed from the " +
+			"meter totals (correct across DST; consumption during outages over an hour is listed separately under gaps), with average and peak power (toppeffekt) per period. " +
 			"Buckets follow local calendar periods; weeks start on Monday."},
 		s.consumption)
 	add(log, srv, &mcp.Tool{Name: "get_timeseries", Annotations: ro,
-		Description: "Power (W) or water flow (l/h) over time, downsampled to at most max_points steps with min/avg/max per step. " +
-			"Use for curves and to find when something happened."},
+		Description: "Power (W, effekt) or water flow (l/h) over time, downsampled to at most max_points steps with min/avg/max per step. " +
+			"Use for curves, peaks (toppeffekt) and to find when something happened."},
 		s.timeseries)
 	add(log, srv, &mcp.Tool{Name: "get_baseload", Annotations: ro,
-		Description: "Standby load and night-time water use per night: power statistics and litres used within a night " +
+		Description: "Standby load and night-time use per night (nattförbrukning, standby, baslast, läckage): power statistics and litres used within a night " +
 			"window (default 01:00-05:00 local), plus a summary with typical baseload, its yearly energy and trend. " +
 			"Water used at night on many nights suggests a leak."},
 		s.baseload)
@@ -101,18 +113,14 @@ func newServer(log *slog.Logger, s *server) *mcp.Server {
 			"Check this before comparing periods or trusting averages."},
 		s.dataInfo)
 	add(log, srv, &mcp.Tool{Name: "query", Annotations: ro, OutputSchema: queryOutputSchema,
-		Description: fmt.Sprintf("Run one read-only SQL SELECT against the measurement table (see resource elva://schema). "+
+		Description: fmt.Sprintf("Run one read-only SQL SELECT against the measurement table (see get_schema). "+
 			"Session time zone is %s. At most %d rows are returned; aggregate in SQL instead of fetching raw minutes.",
 			s.loc, s.maxRows)},
 		s.query)
 
-	srv.AddResource(&mcp.Resource{URI: "elva://schema", Name: "schema", Title: "ElVa database schema", MIMEType: "text/markdown",
-		Description: "The measurement table, units and how to compute consumption."},
-		func(context.Context, *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{
-				URI: "elva://schema", MIMEType: "text/markdown", Text: fmt.Sprintf(schemaDoc, s.loc),
-			}}}, nil
-		})
+	add(log, srv, &mcp.Tool{Name: "get_schema", Annotations: ro,
+		Description: "Table, units and how consumption is computed: read this when a value looks off, or before writing SQL for query."},
+		s.schema)
 	return srv
 }
 
@@ -140,6 +148,38 @@ func add[In, Out any](log *slog.Logger, srv *mcp.Server, t *mcp.Tool, h func(con
 	})
 }
 
+// earliest is the oldest stored reading in local RFC 3339, nil if there is none.
+func (s *server) earliest(ctx context.Context) (*string, error) {
+	t, err := s.db.Earliest(ctx)
+	if err != nil || t == nil {
+		return nil, err
+	}
+	return ptr(s.ts(*t)), nil
+}
+
+// beforeData is a note for answers whose range starts before the oldest reading.
+func beforeData(from time.Time, earliest *string) []string {
+	if earliest == nil {
+		return nil
+	}
+	if e, err := time.Parse(time.RFC3339, *earliest); err != nil || !from.Before(e) {
+		return nil
+	}
+	return []string{"the range starts before the oldest stored reading (earliest_data): there is no data before it"}
+}
+
+// --- get_schema
+
+type schemaIn struct{}
+
+type schemaOut struct {
+	Schema string `json:"schema" jsonschema:"the measurement table, units and how consumption is computed (Markdown)"`
+}
+
+func (s *server) schema(context.Context, schemaIn) (schemaOut, error) {
+	return schemaOut{Schema: fmt.Sprintf(schemaDoc, s.loc)}, nil
+}
+
 // --- get_latest
 
 type latestIn struct{}
@@ -151,6 +191,7 @@ type latestOut struct {
 	EnergyKWh  *float64 `json:"energy_total_kwh"`
 	FlowLPerH  *float32 `json:"water_flow_l_per_h"`
 	VolumeL    *int64   `json:"water_total_l"`
+	Earliest   *string  `json:"earliest_data"`
 }
 
 func (s *server) latest(ctx context.Context, _ latestIn) (latestOut, error) {
@@ -163,6 +204,9 @@ func (s *server) latest(ctx context.Context, _ latestIn) (latestOut, error) {
 	}
 	out := latestOut{Time: s.ts(r.Time), AgeSeconds: int(s.now().Sub(r.Time).Seconds()),
 		PowerW: r.ElPower, FlowLPerH: r.VaFlow, VolumeL: r.VaVolume}
+	if out.Earliest, err = s.earliest(ctx); err != nil {
+		return latestOut{}, err
+	}
 	if r.ElEnergy != nil {
 		out.EnergyKWh = ptr(float64(*r.ElEnergy) / 1000)
 	}
@@ -191,15 +235,30 @@ type bucketOut struct {
 	Partial     bool     `json:"partial,omitempty"`
 }
 
+type gapUseOut struct {
+	From   string   `json:"from"`
+	To     string   `json:"to"`
+	Hours  float64  `json:"hours"`
+	ElKWh  *float64 `json:"electricity_kwh"`
+	WaterL *int64   `json:"water_l"`
+}
+
 type consumptionOut struct {
 	From        string      `json:"from"`
 	To          string      `json:"to"`
 	Bucket      string      `json:"bucket"`
+	Earliest    *string     `json:"earliest_data"`
 	TotalKWh    float64     `json:"total_electricity_kwh"`
 	TotalWaterL int64       `json:"total_water_l"`
 	Buckets     []bucketOut `json:"buckets"`
+	GapKWh      float64     `json:"gap_electricity_kwh"`
+	GapWaterL   int64       `json:"gap_water_l"`
+	Gaps        []gapUseOut `json:"gaps"`
 	Notes       []string    `json:"notes,omitempty"`
 }
+
+// maxGapsOut caps the gaps listed in a get_consumption answer (the longest are kept).
+const maxGapsOut = 20
 
 var approxBucket = map[string]time.Duration{"hour": time.Hour, "day": 24 * time.Hour, "week": 7 * 24 * time.Hour, "month": 28 * 24 * time.Hour, "year": 365 * 24 * time.Hour}
 
@@ -213,11 +272,15 @@ func (s *server) consumption(ctx context.Context, in consumptionIn) (consumption
 	if d, ok := approxBucket[in.Bucket]; ok && to.Sub(from)/d > maxBuckets {
 		return consumptionOut{}, fmt.Errorf("more than %d %s buckets: use a larger bucket or a shorter range", maxBuckets, in.Bucket)
 	}
-	bs, err := s.db.Consumption(ctx, from, to, in.Bucket)
+	bs, gaps, err := s.db.Consumption(ctx, from, to, in.Bucket)
 	if err != nil {
 		return consumptionOut{}, err
 	}
-	out := consumptionOut{From: s.ts(from), To: s.ts(to), Bucket: in.Bucket, Buckets: []bucketOut{}}
+	out := consumptionOut{From: s.ts(from), To: s.ts(to), Bucket: in.Bucket, Buckets: []bucketOut{}, Gaps: []gapUseOut{}}
+	if out.Earliest, err = s.earliest(ctx); err != nil {
+		return consumptionOut{}, err
+	}
+	out.Notes = beforeData(from, out.Earliest)
 	lowCoverage := false
 	for _, b := range bs {
 		out.Buckets = append(out.Buckets, bucketOut{Start: s.ts(b.Start), ElKWh: roundPtr(b.ElKWh, 3), WaterL: b.WaterL,
@@ -231,11 +294,31 @@ func (s *server) consumption(ctx context.Context, in consumptionIn) (consumption
 		lowCoverage = lowCoverage || b.Coverage < 0.9
 	}
 	out.TotalKWh = round(out.TotalKWh, 3)
-	if len(bs) > 0 && bs[0].Partial {
-		out.Notes = append(out.Notes, "the first period is partial: there is no reading before it, so it counts from its first reading")
+	for _, g := range gaps {
+		if g.ElKWh != nil {
+			out.GapKWh += *g.ElKWh
+		}
+		if g.WaterL != nil {
+			out.GapWaterL += *g.WaterL
+		}
+	}
+	out.GapKWh = round(out.GapKWh, 3)
+	slices.SortStableFunc(gaps, func(a, b store.GapUse) int { return cmp.Compare(b.To.Sub(b.From), a.To.Sub(a.From)) })
+	for _, g := range gaps[:min(len(gaps), maxGapsOut)] {
+		out.Gaps = append(out.Gaps, gapUseOut{From: s.ts(g.From), To: s.ts(g.To), Hours: round(g.To.Sub(g.From).Hours(), 1),
+			ElKWh: roundPtr(g.ElKWh, 3), WaterL: g.WaterL})
+	}
+	if slices.ContainsFunc(bs, func(b store.Bucket) bool { return b.Partial }) {
+		out.Notes = append(out.Notes, "partial periods count from their first reading, because there is no reading before them or the previous one is more than an hour earlier: their consumption is too low")
+	}
+	if len(gaps) > 0 {
+		out.Notes = append(out.Notes, fmt.Sprintf("%d gap(s) over an hour: their consumption (gap_electricity_kwh, gap_water_l) is known but not when it happened, so it is in no period and not in the totals; the total used from the last reading before the range is total + gap", len(gaps)))
+	}
+	if len(gaps) > maxGapsOut {
+		out.Notes = append(out.Notes, fmt.Sprintf("gaps lists the %d longest", maxGapsOut))
 	}
 	if lowCoverage {
-		out.Notes = append(out.Notes, "some periods have coverage below 90 %: consumption is still correct, but averages and peaks miss the gaps, and a gap's consumption lands in the period after it")
+		out.Notes = append(out.Notes, "some periods have coverage below 90 %: averages and peaks miss the gaps")
 	}
 	if len(bs) == 0 {
 		out.Notes = append(out.Notes, "no readings in this range")
@@ -259,10 +342,12 @@ type pointOut struct {
 }
 
 type timeseriesOut struct {
-	Field  string     `json:"field"`
-	Unit   string     `json:"unit"`
-	Step   string     `json:"step"`
-	Points []pointOut `json:"points"`
+	Field    string     `json:"field"`
+	Unit     string     `json:"unit"`
+	Step     string     `json:"step"`
+	Earliest *string    `json:"earliest_data"`
+	Points   []pointOut `json:"points"`
+	Notes    []string   `json:"notes,omitempty"`
 }
 
 func (s *server) timeseries(ctx context.Context, in timeseriesIn) (timeseriesOut, error) {
@@ -281,6 +366,10 @@ func (s *server) timeseries(ctx context.Context, in timeseriesIn) (timeseriesOut
 		return timeseriesOut{}, err
 	}
 	out := timeseriesOut{Field: in.Field, Unit: map[string]string{"power": "W", "flow": "l/h"}[in.Field], Step: step.String(), Points: []pointOut{}}
+	if out.Earliest, err = s.earliest(ctx); err != nil {
+		return timeseriesOut{}, err
+	}
+	out.Notes = beforeData(from, out.Earliest)
 	for _, p := range pts {
 		out.Points = append(out.Points, pointOut{Time: s.ts(p.Time), Min: round(p.Min, 1), Avg: round(p.Avg, 1), Max: round(p.Max, 1)})
 	}
@@ -325,12 +414,13 @@ type baseloadSummary struct {
 }
 
 type baseloadOut struct {
-	Window  string          `json:"window"`
-	Group   string          `json:"group"`
-	Summary baseloadSummary `json:"summary"`
-	Nights  []nightOut      `json:"nights,omitempty"`  // group=night
-	Periods []periodOut     `json:"periods,omitempty"` // group=week or month
-	Notes   []string        `json:"notes"`
+	Window   string          `json:"window"`
+	Group    string          `json:"group"`
+	Earliest *string         `json:"earliest_data"`
+	Summary  baseloadSummary `json:"summary"`
+	Nights   []nightOut      `json:"nights,omitempty"`  // group=night
+	Periods  []periodOut     `json:"periods,omitempty"` // group=week or month
+	Notes    []string        `json:"notes"`
 }
 
 var hhmm = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
@@ -374,6 +464,10 @@ func (s *server) baseload(ctx context.Context, in baseloadIn) (baseloadOut, erro
 		"avg_w includes fridge/freezer cycles and anything run at night (dishwasher timers, car charging)",
 		"water_l counts whole litres used inside the window; regular non-zero nights suggest a leak or dripping tap",
 	}}
+	if out.Earliest, err = s.earliest(ctx); err != nil {
+		return baseloadOut{}, err
+	}
+	out.Notes = append(out.Notes, beforeData(from, out.Earliest)...)
 	var p10s, mins []float64
 	for _, n := range ns {
 		if group == "night" {
@@ -481,6 +575,7 @@ type gapOut struct {
 }
 
 type dataInfoOut struct {
+	Earliest            *string  `json:"earliest_data"`
 	Rows                int64    `json:"rows"`
 	First               *string  `json:"first_reading"`
 	Last                *string  `json:"last_reading"`
@@ -509,6 +604,9 @@ func (s *server) dataInfo(ctx context.Context, in dataInfoIn) (dataInfoOut, erro
 	}
 	out := dataInfoOut{Rows: d.Rows, RowsWithElectricity: d.RowsWithEl, RowsWithWater: d.RowsWithWater,
 		Gaps: d.Gaps, GapHoursTotal: round(d.GapTotal.Hours(), 1), LargestGaps: []gapOut{}}
+	if out.Earliest, err = s.earliest(ctx); err != nil {
+		return dataInfoOut{}, err
+	}
 	if d.First != nil {
 		out.First, out.Last = ptr(s.ts(*d.First)), ptr(s.ts(*d.Last))
 	}

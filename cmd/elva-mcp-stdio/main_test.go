@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -169,7 +170,7 @@ func TestTools(t *testing.T) {
 			t.Errorf("%s not marked read-only", tool.Name)
 		}
 	}
-	if got := strings.Join(names, ","); got != "get_baseload,get_consumption,get_data_info,get_latest,get_timeseries,query" {
+	if got := strings.Join(names, ","); got != "get_baseload,get_consumption,get_data_info,get_latest,get_schema,get_timeseries,query" {
 		t.Errorf("tools = %s", got)
 	}
 	schema, _ := json.Marshal(tools.Tools[1].InputSchema) // get_consumption
@@ -196,14 +197,19 @@ func TestTools(t *testing.T) {
 		t.Errorf("get_latest power_w not rewritten to anyOf: %s", latestSchema)
 	}
 
-	res, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: "elva://schema"})
-	if err != nil || !strings.Contains(res.Contents[0].Text, "el_energy") {
-		t.Errorf("schema resource: %v", err)
+	if res, err := cs.ListResources(ctx, nil); err == nil && len(res.Resources) > 0 {
+		t.Errorf("resources = %d, want none (get_schema replaces them)", len(res.Resources))
+	}
+	var sch schemaOut
+	call(t, cs, "get_schema", nil, &sch)
+	if !strings.Contains(sch.Schema, "el_energy") {
+		t.Errorf("get_schema = %.100q", sch.Schema)
 	}
 
 	var latest latestOut
 	call(t, cs, "get_latest", nil, &latest)
-	if *latest.PowerW != 400 || latest.Time != "2026-11-21T23:59:00+01:00" || latest.AgeSeconds != 60 {
+	if *latest.PowerW != 400 || latest.Time != "2026-11-21T23:59:00+01:00" || latest.AgeSeconds != 60 ||
+		latest.Earliest == nil || *latest.Earliest != "2026-11-20T00:00:00+01:00" {
 		t.Errorf("get_latest = %+v", latest)
 	}
 
@@ -215,6 +221,14 @@ func TestTools(t *testing.T) {
 	}
 	if cons.Buckets[0].Start != "2026-11-20T00:00:00+01:00" || !cons.Buckets[0].Partial || cons.Buckets[1].CoveragePct != 100 {
 		t.Errorf("buckets = %+v", cons.Buckets)
+	}
+	if *cons.Earliest != "2026-11-20T00:00:00+01:00" || slices.ContainsFunc(cons.Notes, func(n string) bool { return strings.Contains(n, "before the oldest") }) {
+		t.Errorf("get_consumption earliest = %s, notes %q", *cons.Earliest, cons.Notes)
+	}
+	var early consumptionOut
+	call(t, cs, "get_consumption", map[string]any{"from": "2026-11-01", "to": "2026-11-22", "bucket": "week"}, &early)
+	if !slices.ContainsFunc(early.Notes, func(n string) bool { return strings.Contains(n, "before the oldest") }) {
+		t.Errorf("range before the data: notes %q", early.Notes)
 	}
 
 	var ts timeseriesOut

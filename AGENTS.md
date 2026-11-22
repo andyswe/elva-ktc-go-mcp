@@ -139,7 +139,7 @@ written", and the table should have no gap.
 | `cmd/elva/buffer.go` | In-memory row buffer for database outages (`ELVA_DATABASE_BUFFER`), flushed oldest first in chunks |
 | `cmd/elva/config.go` | The scraper's settings table and `parseConfig` |
 | `cmd/elva-mcp-stdio/main.go` | MCP server: settings, read-only database connection, `-check`, stdio transport |
-| `cmd/elva-mcp-stdio/tools.go` | Tool definitions and handlers, server instructions, the `elva://schema` resource |
+| `cmd/elva-mcp-stdio/tools.go` | Tool definitions and handlers, server instructions, `get_schema` |
 | `cmd/elva-mcp-stdio/schema.go` | `schemaFor`: portable JSON Schemas for tool inputs and outputs (rule 7) |
 | `cmd/elva-mcp-stdio/when.go` | Parses time inputs (`2026-11`, `-7d`, RFC 3339, ...) in local time |
 | `internal/config/config.go` | Shared settings machinery: flags (`Flags`, `FlagName`), env file, priority and sources, secret masking, `-help` |
@@ -294,14 +294,28 @@ CREATE TABLE IF NOT EXISTS measurement (
 - **Tools** (all marked read-only):
   - `get_latest`;
   - `get_consumption`: deltas of the totals per `date_trunc` bucket, with a baseline
-    from the last row before the range, at most 1000 buckets;
+    from the last row before the range, at most 1000 buckets. After a gap longer
+    than `store.MaxGap` (1 h) a bucket counts from its own first reading
+    (`partial`), and the gap's consumption goes to `gaps` instead
+    (`gap_electricity_kwh`, the 20 longest listed). Otherwise a period after an outage
+    of weeks would show the whole outage, as 2026-11 did after v1's 96-day gap. A gap
+    inside one bucket stays in it, since the consumption did happen in that period;
   - `get_timeseries`: `date_bin`, at most 2000 points;
   - `get_baseload`: per night within a local window; per week or month beyond 62 or
     366 nights;
   - `get_data_info`: gaps via `lag()`;
+  - `get_schema`: the table and how consumption is computed. It is a tool, not an MCP
+    resource, because many clients expose resources only through generic
+    `list_resources`/`read_resource` tools that models skip;
   - `query`.
 
-  The resource is `elva://schema`.
+  There are no resources. Every answer except `query` and `get_schema` carries
+  `earliest_data` (`min(time)`, from the primary key index), plus a note when the
+  range starts before it.
+- **Descriptions are search terms.** Clients that defer tools find them by keyword, so
+  the server instructions and tool descriptions name the Swedish words users ask
+  with (el, elförbrukning, nattförbrukning, standby, toppeffekt, senaste veckan, ...)
+  and say there is no other data source.
 - **Time:** `ELVA_TIMEZONE` sets the session time zone and the bucket boundaries;
   outputs are local RFC 3339.
 - **Exit codes** follow `elva`: 1 for bad settings, 5 if the database can't be reached

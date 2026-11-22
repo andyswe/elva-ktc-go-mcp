@@ -63,6 +63,15 @@ func (r *Reader) LatestRow(ctx context.Context) (*Row, error) {
 	return &row, err
 }
 
+// Earliest returns the time of the oldest row, or nil if the table is empty.
+func (r *Reader) Earliest(ctx context.Context) (*time.Time, error) {
+	var t *time.Time
+	if err := r.pool.QueryRow(ctx, `SELECT min(time) FROM measurement`).Scan(&t); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
 // Bucket is consumption in one calendar period.
 type Bucket struct {
 	Start     time.Time // local start of the period
@@ -73,82 +82,142 @@ type Bucket struct {
 	MaxPowerW *int32
 	Rows      int
 	Coverage  float64 // rows / minutes in the (clipped) period; 1 = no gaps
-	// Partial is true when there was no reading before the period, so consumption is
-	// measured from its first reading instead of from the end of the previous period.
+	// Partial is true when consumption is measured from the period's first reading
+	// instead of from the previous reading: there was none, or it was more than
+	// MaxGap earlier (its consumption is then in a GapUse).
 	Partial bool
 }
+
+// GapUse is consumption across a gap of more than MaxGap that ends in a bucket. The
+// meter totals show how much was used, but not when, so it is not counted in any
+// bucket.
+type GapUse struct {
+	From, To time.Time // last reading before the gap, first reading after it
+	ElKWh    *float64
+	WaterL   *int64
+}
+
+// MaxGap is the longest gap whose consumption Consumption still counts in the
+// bucket after it. Longer gaps go to GapUse, so that a period after an outage of
+// weeks doesn't show the whole outage's consumption.
+const MaxGap = time.Hour
 
 // Buckets supported by Consumption, as PostgreSQL date_trunc fields.
 var Buckets = []string{"hour", "day", "week", "month", "year"}
 
+// meter tracks one meter total through Consumption.
+type meter struct {
+	prev     *int64 // last total seen
+	prevTime time.Time
+}
+
+// step returns the consumption in a bucket whose readings are lo..hi (first at
+// firstT, last at lastT), and the consumption across a gap before it, if longer
+// than MaxGap.
+func (m *meter) step(lo, hi *int64, firstT, lastT *time.Time) (used, gapUsed *int64, partial bool) {
+	if hi == nil {
+		return nil, nil, false
+	}
+	base := m.prev
+	switch {
+	case base == nil:
+		base, partial = lo, true
+	case firstT.Sub(m.prevTime) > MaxGap:
+		if d := *lo - *base; d >= 0 {
+			gapUsed = &d
+		}
+		base, partial = lo, true
+	}
+	if d := *hi - *base; d >= 0 {
+		used = &d
+	} // a negative delta means the meter was replaced or reset: report nothing
+	m.prev, m.prevTime = hi, *lastT
+	return used, gapUsed, partial
+}
+
 // Consumption sums consumption per calendar bucket between from and to. It uses the
 // meter totals: consumption in a bucket is its last total minus the last total
-// before it, which stays correct across gaps (the gap's consumption lands in the
-// first bucket after it) and summer time changes.
-func (r *Reader) Consumption(ctx context.Context, from, to time.Time, bucket string) ([]Bucket, error) {
+// before it, which is correct across short gaps and summer time changes. After a
+// gap longer than MaxGap a bucket counts from its own first reading, and the gap's
+// consumption is returned separately.
+func (r *Reader) Consumption(ctx context.Context, from, to time.Time, bucket string) ([]Bucket, []GapUse, error) {
 	if !slices.Contains(Buckets, bucket) {
-		return nil, fmt.Errorf("bucket must be one of %v", Buckets)
+		return nil, nil, fmt.Errorf("bucket must be one of %v", Buckets)
 	}
-	var prevEl, prevVa *int64
-	err := r.pool.QueryRow(ctx, `SELECT
-		(SELECT el_energy FROM measurement WHERE time < $1 AND el_energy IS NOT NULL ORDER BY time DESC LIMIT 1),
-		(SELECT va_volume FROM measurement WHERE time < $1 AND va_volume IS NOT NULL ORDER BY time DESC LIMIT 1)`,
-		from).Scan(&prevEl, &prevVa)
+	var el, va meter
+	var elT, vaT *time.Time
+	err := r.pool.QueryRow(ctx, `SELECT e.el_energy, e.time, v.va_volume, v.time FROM
+		(SELECT 1) one
+		LEFT JOIN (SELECT el_energy, time FROM measurement WHERE time < $1 AND el_energy IS NOT NULL ORDER BY time DESC LIMIT 1) e ON true
+		LEFT JOIN (SELECT va_volume, time FROM measurement WHERE time < $1 AND va_volume IS NOT NULL ORDER BY time DESC LIMIT 1) v ON true`,
+		from).Scan(&el.prev, &elT, &va.prev, &vaT)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if elT != nil {
+		el.prevTime = *elT
+	}
+	if vaT != nil {
+		va.prevTime = *vaT
 	}
 	rows, err := r.pool.Query(ctx, `SELECT date_trunc($1, time AT TIME ZONE $2),
-			min(el_energy), max(el_energy), min(va_volume), max(va_volume),
+			min(el_energy), max(el_energy), min(time) FILTER (WHERE el_energy IS NOT NULL), max(time) FILTER (WHERE el_energy IS NOT NULL),
+			min(va_volume), max(va_volume), min(time) FILTER (WHERE va_volume IS NOT NULL), max(time) FILTER (WHERE va_volume IS NOT NULL),
 			avg(el_power)::float8, max(el_power), count(*)
 		FROM measurement WHERE time >= $3 AND time < $4
 		GROUP BY 1 ORDER BY 1`, bucket, r.loc.String(), from, to)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	var out []Bucket
+	var (
+		out  []Bucket
+		gaps []GapUse
+	)
 	for rows.Next() {
 		var (
 			b                          Bucket
 			local                      time.Time
 			elMin, elMax, vaMin, vaMax *int64
+			elT0, elT1, vaT0, vaT1     *time.Time
 		)
-		if err := rows.Scan(&local, &elMin, &elMax, &vaMin, &vaMax, &b.AvgPowerW, &b.MaxPowerW, &b.Rows); err != nil {
-			return nil, err
+		if err := rows.Scan(&local, &elMin, &elMax, &elT0, &elT1, &vaMin, &vaMax, &vaT0, &vaT1,
+			&b.AvgPowerW, &b.MaxPowerW, &b.Rows); err != nil {
+			return nil, nil, err
 		}
 		b.Start = time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, r.loc)
 		b.End = nextBucket(b.Start, bucket)
-		var elUsed, vaUsed *int64
-		elUsed, prevEl, b.Partial = delta(prevEl, elMin, elMax)
-		var vaPartial bool
-		vaUsed, prevVa, vaPartial = delta(prevVa, vaMin, vaMax)
-		b.Partial = b.Partial || vaPartial
+		elPrevT, vaPrevT := el.prevTime, va.prevTime
+		elUsed, elGap, elPartial := el.step(elMin, elMax, elT0, elT1)
+		vaUsed, vaGap, vaPartial := va.step(vaMin, vaMax, vaT0, vaT1)
+		b.Partial = elPartial || vaPartial
 		if elUsed != nil {
 			b.ElKWh = ptr(float64(*elUsed) / 1000)
 		}
 		b.WaterL = vaUsed
+		if elGap != nil {
+			gaps = addGap(gaps, GapUse{From: elPrevT.In(r.loc), To: elT0.In(r.loc), ElKWh: ptr(float64(*elGap) / 1000)})
+		}
+		if vaGap != nil {
+			gaps = addGap(gaps, GapUse{From: vaPrevT.In(r.loc), To: vaT0.In(r.loc), WaterL: vaGap})
+		}
 		start, end := maxTime(b.Start, from), minTime(b.End, to)
 		if minutes := end.Sub(start).Minutes(); minutes > 0 {
 			b.Coverage = math.Min(1, float64(b.Rows)/minutes)
 		}
 		out = append(out, b)
 	}
-	return out, rows.Err()
+	return out, gaps, rows.Err()
 }
 
-// delta returns the consumption in a bucket and the new previous total.
-func delta(prev, lo, hi *int64) (used, newPrev *int64, partial bool) {
-	if hi == nil {
-		return nil, prev, false
+// addGap records an electricity or a water gap, merging it into the previous entry
+// when both meters have the same gap (the normal case: whole rows missing).
+func addGap(gaps []GapUse, g GapUse) []GapUse {
+	if n := len(gaps); n > 0 && gaps[n-1].From.Equal(g.From) && gaps[n-1].To.Equal(g.To) {
+		gaps[n-1].WaterL = g.WaterL // el is always added first
+		return gaps
 	}
-	base := prev
-	if base == nil {
-		base, partial = lo, true
-	}
-	if d := *hi - *base; d >= 0 {
-		used = &d
-	} // a negative delta means the meter was replaced or reset: report nothing
-	return used, hi, partial
+	return append(gaps, g)
 }
 
 func nextBucket(t time.Time, bucket string) time.Time {
